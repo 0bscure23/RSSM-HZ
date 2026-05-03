@@ -1,0 +1,23 @@
+# 数据文件
+Dataset/
+*.h5
+*.mat
+
+# 模型权重
+checkpoints/
+*.pth
+
+# 实验结果/日志
+results/
+results_rssm_hz/
+output_log/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# IDE
+.vscode/
+.idea/
