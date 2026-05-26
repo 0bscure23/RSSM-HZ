@@ -1,13 +1,12 @@
-# RSSM-HZ: Recurrent State-Space Model for Wavelet-based Pansharpening
+# RSSM-HZ: Coarse-to-Fine Recurrent Wavelet Fusion for Pansharpening
 
-This repository contains the code for our RSSM-HZ pansharpening method, which achieves state-of-the-art performance by modeling coarse-to-fine wavelet fusion as a recurrent state-space process.
+This repository contains the code for RSSM-HZ, a pansharpening model that treats multi-level wavelet subbands as a coarse-to-fine sequence and updates a hidden state across scales.
 
-## Key Results (Jilin Dataset, PanScale Benchmark)
+The project is still under active experimentation. The strongest current evidence is on PanScale-style datasets, where RSSM-HZ reaches or exceeds the local WFANet reproduction while using a recurrent wavelet fusion path instead of WFANet's heavier attention-style fusion. On the original WV3/GF2/QB protocol, RSSM-HZ is close on WV3 but still behind on GF2/QB.
 
-| Method | Q8 | PSNR | SAM | ERGAS |
-|--------|-----|------|-----|-------|
-| **RSSM-HZ (ours)** | **0.9529** | **39.48** | **1.13** | **1.17** |
-| WFANet | 0.9529 | 39.40 | 1.15 | 1.18 |
+## Current Snapshot
+
+See [CURRENT_STATUS.md](CURRENT_STATUS.md) for the latest experiment summary, open issues, and next steps.
 
 ## Quick Start
 
@@ -26,6 +25,23 @@ python train_rssmhz_crop.py \
     --run-tag my_experiment_phaseB
 ```
 
+For validation-driven full-image fine-tuning:
+
+```bash
+python train_rssm_hz.py \
+    --config super_para_panscale.yml \
+    --gpu 0 \
+    --run-tag jilin_full_finetune \
+    --train-path Dataset/PanScale_H5/jilin/jilin_train_v2.h5 \
+    --val-path Dataset/PanScale_H5/jilin/jilin_val_v2.h5 \
+    --test-path Dataset/PanScale_H5/jilin/jilin_test200.h5 \
+    --init-ckpt results_rssm_hz/jilin_h128_800ep/checkpoints/rssm_hz_best.pth \
+    --epochs 200 --batch-size 4 \
+    --hidden-dim 128 --latent-dim 48 \
+    --phase a --lr-scale 0.01 \
+    --val-every 20 --best-metric overall
+```
+
 ## File Structure
 
 ```
@@ -36,7 +52,10 @@ python train_rssmhz_crop.py \
 ├── train_wfanet_jilin_crop.py # WFANet baseline training
 ├── evaluate_wv3_metrics.py    # PSNR/SAM/ERGAS/Q8 evaluation
 ├── convert_panscale_to_h5.py  # Data preprocessing
+├── matlab_eval/               # MATLAB/Octave-style reduced-resolution evaluation helpers
 ├── super_para_panscale.yml    # Jilin dataset config
+├── super_para_gf2_2047.yml    # GF2 4-channel reduced-resolution config
+├── super_para_qb.yml          # QB 4-channel reduced-resolution config
 └── super_para.yml             # WV3 dataset config
 ```
 
@@ -44,3 +63,4 @@ python train_rssmhz_crop.py \
 
 - [CODE_DOCUMENTATION.md](CODE_DOCUMENTATION.md) — Detailed code walkthrough with diagrams
 - [PROJECT_REPORT.md](PROJECT_REPORT.md) — Project report with experiment history
+- [CURRENT_STATUS.md](CURRENT_STATUS.md) — Current progress, results, limitations, and discussion points
