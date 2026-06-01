@@ -71,6 +71,8 @@ Follow-up WIP added after the first head-only probe:
 - `launch_headreduce_round_20260601.sh` runs GF2/QB with head-reduce using L1-only and SAM+LL variants.
 - `launch_level_ll_round_20260601.sh` additionally enables per-level `LevelLLCorrection`, so low-frequency/spectral bias can be corrected before hierarchical IDWT instead of only at the final output.
 - `launch_level_ll_state_round_20260601.sh` is the stronger follow-up: it keeps shallow encoders frozen but fine-tunes recurrent fusion blocks, gates, per-level LL correction, and output heads with a small LR.
+- `launch_level_ll_state_focus_20260601.sh` keeps only the two most promising state-level variants active: GF2 L1 and QB SAM+LL.
+- `launch_level_ll_state_from_reduce_20260601.sh` starts state-level fine-tuning from the improved per-level-LL reduce checkpoints instead of the older innovation-z checkpoints.
 - These variants still use only convolutional/local operations and keep the intended linear-complexity advantage over WFANet-style global attention.
 
 ## Uploaded Lightweight Metric JSONs
