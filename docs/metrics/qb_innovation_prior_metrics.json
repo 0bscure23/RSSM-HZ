@@ -1,0 +1,65 @@
+{
+  "PSNR": 37.99185453480018,
+  "PSNR_global": 37.51821706778284,
+  "SAM": 4.60889278824414,
+  "ERGAS": 3.8574658613398576,
+  "Q": 0.8322184760044914,
+  "Q8": 0.8322184760044914,
+  "Q4": 0.8322184760044914,
+  "q_win_size": 4,
+  "num_samples": 20,
+  "eval_clamp": false,
+  "z_diagnostics": {
+    "num_records": 60,
+    "per_level": [
+      {
+        "level": 0,
+        "num_batches": 20,
+        "force_zero_z": false,
+        "alpha_hh_delta_z0": 0.00581082992721349,
+        "alpha_hh_mean": 0.5773717015981674,
+        "alpha_hl_delta_z0": 0.004612089577130973,
+        "alpha_hl_mean": 0.586439710855484,
+        "alpha_lh_delta_z0": 0.004181742889340967,
+        "alpha_lh_mean": 0.5420907706022262,
+        "kl_mean": 0.0,
+        "ll_delta_z0": 0.09250066597014665,
+        "z_abs_mean": 0.39048103541135787,
+        "z_gate_abs_mean": 0.21943055242300033,
+        "z_std": 0.5056147173047065
+      },
+      {
+        "level": 1,
+        "num_batches": 20,
+        "force_zero_z": false,
+        "alpha_hh_delta_z0": 0.005490187730174512,
+        "alpha_hh_mean": 0.24584774896502495,
+        "alpha_hl_delta_z0": 0.0047982806048821654,
+        "alpha_hl_mean": 0.314261669665575,
+        "alpha_lh_delta_z0": 0.0044280027155764404,
+        "alpha_lh_mean": 0.2857728525996208,
+        "kl_mean": 0.0,
+        "ll_delta_z0": 0.028304990939795972,
+        "z_abs_mean": 0.3102510437369347,
+        "z_gate_abs_mean": 0.1391920644789934,
+        "z_std": 0.40862639546394347
+      },
+      {
+        "level": 2,
+        "num_batches": 20,
+        "force_zero_z": false,
+        "alpha_hh_delta_z0": 0.0008491152460919693,
+        "alpha_hh_mean": 0.210529438406229,
+        "alpha_hl_delta_z0": 0.0009236398822395131,
+        "alpha_hl_mean": 0.19098414927721025,
+        "alpha_lh_delta_z0": 0.0008032302517676726,
+        "alpha_lh_mean": 0.19450826048851014,
+        "kl_mean": 0.0,
+        "ll_delta_z0": 0.0008701772603671998,
+        "z_abs_mean": 0.03969993814826012,
+        "z_gate_abs_mean": 0.44070640206336975,
+        "z_std": 0.0476660281419754
+      }
+    ]
+  }
+}

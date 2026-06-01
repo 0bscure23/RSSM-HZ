@@ -1,5 +1,10 @@
 # RSSM-HZ Current Status
 
+Updated: 2026-06-01.
+
+For the latest GF2/QB innovation-z metrics and online-friendly JSON summaries,
+see [docs/experiment_results_20260601.md](docs/experiment_results_20260601.md).
+
 This note summarizes the current state of the RSSM-HZ experiments so the project can be handed to another model or collaborator for review.
 
 ## 1. Goal
@@ -120,13 +125,17 @@ These results are still weaker than WFANet.
 | WV3 | RSSM-HZ no-distill best | 38.9393 | 2.9354 | 2.1739 | 0.8755 |
 | WV3 | RSSM-HZ continued fine-tune | 38.9397 | 2.9383 | 2.1746 | 0.8755 |
 | GF2 | WFANet repro | 50.0684 | 0.6641 | 0.5899 | 0.9088 |
-| GF2 | RSSM-HZ current | 48.4208 | 0.7752 | 0.7183 | 0.8882 |
+| GF2 | RSSM-HZ older baseline | 48.4208 | 0.7752 | 0.7183 | 0.8882 |
+| GF2 | RSSM-HZ innovation-z | 48.9536 | 0.7363 | 0.6753 | 0.8956 |
 | QB | WFANet repro | 38.6932 | 4.3781 | 3.5485 | 0.8463 |
-| QB | RSSM-HZ current | 37.6153 | 4.7196 | 4.0308 | 0.8273 |
+| QB | RSSM-HZ older baseline | 37.6153 | 4.7196 | 4.0308 | 0.8273 |
+| QB | RSSM-HZ innovation-z | 37.9858 | 4.6096 | 3.8598 | 0.8322 |
 
 Important metric note:
 
-For GF2/QB, the older comparison used `q_win_size=4`. Some newer `train_rssm_hz.py` evaluations print `Q8` with `q_win_size=8`, which looks much higher. For fair GF2/QB comparison, recompute Q with `q_win_size=4`.
+For GF2/QB, use `q_win_size=4` for fair Q4 comparison. Some older scripts
+printed the metric under `Q8` even when the window size was 4, so always check
+the stored `q_win_size` field in each metrics JSON.
 
 ## 5. Current Open Problems
 

@@ -104,6 +104,13 @@ def sam_loss(pred, gt):
     return torch.nan_to_num(ang.mean(), nan=0.0, posinf=0.0, neginf=0.0)
 
 
+def band_balanced_l1_loss(pred, gt):
+    """Per-band normalized L1 to keep hard spectral bands from being washed out."""
+    diff = (pred - gt).abs().mean(dim=(0, 2, 3))
+    scale = gt.detach().std(dim=(0, 2, 3), unbiased=False).clamp_min(1e-3)
+    return (diff / scale).mean()
+
+
 def psnr_tensor(pred, gt, data_range=1.0):
     mse = torch.mean((pred - gt) ** 2).item()
     mse = max(mse, 1e-12)
@@ -194,6 +201,32 @@ def wavelet_hf_loss_multilevel(pred, gt, dwt_module, l1_loss, level_weights):
     return loss / weight_sum
 
 
+def wavelet_ll_loss_multilevel(pred, gt, dwt_module, l1_loss, level_weights):
+    pred_cur = pred
+    gt_cur = gt
+    loss = pred.new_tensor(0.0)
+    weight_sum = 0.0
+
+    for weight in level_weights:
+        pred_w = dwt_module(pred_cur)
+        gt_w = dwt_module(gt_cur)
+        c = pred_cur.shape[1]
+
+        pred_ll = pred_w[:, :c]
+        gt_ll = gt_w[:, :c]
+
+        if weight > 0:
+            loss = loss + float(weight) * l1_loss(pred_ll, gt_ll)
+            weight_sum += float(weight)
+
+        pred_cur = pred_ll
+        gt_cur = gt_ll
+
+    if weight_sum <= 0:
+        return pred.new_tensor(0.0)
+    return loss / weight_sum
+
+
 def save_prediction_mats(pred_scaled, out_dir):
     pred_dir = os.path.join(out_dir, "pred")
     os.makedirs(pred_dir, exist_ok=True)
@@ -201,6 +234,41 @@ def save_prediction_mats(pred_scaled, out_dir):
     pred_np = pred_scaled.numpy().transpose(0, 2, 3, 1)
     for i in range(pred_np.shape[0]):
         savemat(os.path.join(pred_dir, f"pred_{i:02d}.mat"), {"sr": pred_np[i]})
+
+
+def aggregate_z_diagnostics(records):
+    if not records:
+        return {}
+
+    by_level = {}
+    for record in records:
+        level = int(record.get("level", -1))
+        by_level.setdefault(level, []).append(record)
+
+    per_level = []
+    skip_keys = {"level", "force_zero_z"}
+    for level in sorted(by_level.keys()):
+        items = by_level[level]
+        summary = {
+            "level": int(level),
+            "num_batches": int(len(items)),
+            "force_zero_z": bool(any(item.get("force_zero_z", False) for item in items)),
+        }
+        numeric_keys = sorted(
+            key
+            for key in items[0].keys()
+            if key not in skip_keys and isinstance(items[0].get(key), (int, float))
+        )
+        for key in numeric_keys:
+            values = [float(item[key]) for item in items if key in item]
+            if values:
+                summary[key] = float(np.mean(values))
+        per_level.append(summary)
+
+    return {
+        "num_records": int(len(records)),
+        "per_level": per_level,
+    }
 
 
 class ModelEMA:
@@ -250,6 +318,23 @@ def load_state_dict_flexible(model, state_dict):
             skipped.append((key, "missing_in_model"))
             continue
         if model_state[key].shape != value.shape:
+            # Backward compatibility: older gates used
+            # [fused_ll, ll_ms, pan_lh, pan_hl, pan_hh] = 5 * C inputs.
+            # Newer gates append z_gate, so we copy the old weights and keep
+            # the z_gate slice at zero. This preserves old checkpoints exactly.
+            if (
+                "high_gate" in key
+                and key.endswith(".weight")
+                and value.ndim == 4
+                and model_state[key].ndim == 4
+                and value.shape[0] == model_state[key].shape[0]
+                and value.shape[2:] == model_state[key].shape[2:]
+                and value.shape[1] < model_state[key].shape[1]
+            ):
+                padded = torch.zeros_like(model_state[key])
+                padded[:, : value.shape[1], :, :] = value
+                filtered_state[key] = padded
+                continue
             skipped.append((key, f"shape_mismatch {tuple(value.shape)} -> {tuple(model_state[key].shape)}"))
             continue
         filtered_state[key] = value
@@ -308,6 +393,12 @@ def apply_phase_b_freeze(model, freeze_mode):
             ("rssm_fusion.conv_fusion_hl", fusion.conv_fusion_hl),
             ("rssm_fusion.conv_fusion_hh", fusion.conv_fusion_hh),
         ]
+        if getattr(fusion, "residual_learnable_fusion", False):
+            fusion_modules.extend([
+                ("rssm_fusion.conv_fusion_beta_lh", fusion.conv_fusion_beta_lh),
+                ("rssm_fusion.conv_fusion_beta_hl", fusion.conv_fusion_beta_hl),
+                ("rssm_fusion.conv_fusion_beta_hh", fusion.conv_fusion_beta_hh),
+            ])
 
     if hasattr(model, 'image_space_wavelet') and model.image_space_wavelet:
         img_wav_modules = [
@@ -316,6 +407,12 @@ def apply_phase_b_freeze(model, freeze_mode):
         ]
     else:
         img_wav_modules = []
+
+    lowfreq_modules = []
+    if getattr(model, "lowfreq_corr", None) is not None:
+        lowfreq_modules.append(("lowfreq_corr", model.lowfreq_corr))
+    if getattr(model, "band_corr", None) is not None:
+        lowfreq_modules.append(("band_corr", model.band_corr))
 
     if freeze_mode == "state_high":
         for param in model.parameters():
@@ -331,6 +428,7 @@ def apply_phase_b_freeze(model, freeze_mode):
             ("rssm_fusion.z_to_gate", model.rssm_fusion.z_to_gate),
             *img_wav_modules,
             ("reduce", model.reduce),
+            *lowfreq_modules,
             ("out_act", model.out_act),
         ]
         for _, module in trainable_modules:
@@ -350,12 +448,31 @@ def apply_phase_b_freeze(model, freeze_mode):
             *fusion_modules,
             ("rssm_fusion.z_to_gate", model.rssm_fusion.z_to_gate),
             ("reduce", model.reduce),
+            *lowfreq_modules,
             ("out_act", model.out_act),
         ]
         for _, module in trainable_modules:
             for param in module.parameters():
                 param.requires_grad = True
         return [name for name, _ in trainable_modules]
+
+    if freeze_mode == "head_only":
+        for param in model.parameters():
+            param.requires_grad = False
+
+        trainable_modules = [
+            *lowfreq_modules,
+            ("out_act", model.out_act),
+        ]
+        for _, module in trainable_modules:
+            for param in module.parameters():
+                param.requires_grad = True
+        if hasattr(model, "fused_weight"):
+            model.fused_weight.requires_grad = True
+        names = [name for name, _ in trainable_modules]
+        if hasattr(model, "fused_weight"):
+            names.append("fused_weight")
+        return names
 
     raise ValueError(f"Unsupported freeze mode: {freeze_mode}")
 
@@ -371,8 +488,12 @@ def evaluate_dataset(
     export_preds=False,
     batch_size=1,
     num_workers=0,
+    q_win_size=8,
+    tile_size=0,
+    tile_overlap=0,
     results_filename="rssm_hz_results.mat",
     metrics_filename="rssm_hz_metrics.json",
+    collect_z_diagnostics=False,
 ):
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"Missing dataset: {dataset_path}")
@@ -388,17 +509,29 @@ def evaluate_dataset(
     )
 
     model.eval()
+    if collect_z_diagnostics and hasattr(model, "set_z_diagnostics"):
+        model.set_z_diagnostics(True)
+
     preds = []
     gts = []
+    z_diag_records = []
     with torch.no_grad():
         for gt, pan, ms, lms in eval_loader:
-            out, _ = model(
+            out, _, _ = tiled_forward(
+                model,
                 pan.to(device, non_blocking=True),
                 ms.to(device, non_blocking=True),
                 lms.to(device, non_blocking=True),
+                tile_size=tile_size,
+                tile_overlap=tile_overlap,
             )
+            if collect_z_diagnostics and hasattr(model, "get_z_diagnostics"):
+                z_diag_records.extend(model.get_z_diagnostics())
             preds.append(out.cpu())
             gts.append(gt.cpu())
+
+    if collect_z_diagnostics and hasattr(model, "set_z_diagnostics"):
+        model.set_z_diagnostics(False)
 
     pred = torch.cat(preds, dim=0)
     gt = torch.cat(gts, dim=0)
@@ -422,7 +555,7 @@ def evaluate_dataset(
         gt_scaled.numpy(),
         ratio=4.0,
         data_range=float(config["ratio"]),
-        q_win_size=8,
+        q_win_size=int(q_win_size),
     )
 
     metrics = {
@@ -430,19 +563,86 @@ def evaluate_dataset(
         "PSNR_global": float(eval_metrics["PSNR_global"]),
         "SAM": float(eval_metrics["SAM"]),
         "ERGAS": float(eval_metrics["ERGAS"]),
+        "Q": float(eval_metrics["Q"]),
         "Q8": float(eval_metrics["Q"]),
+        f"Q{int(q_win_size)}": float(eval_metrics["Q"]),
+        "q_win_size": int(q_win_size),
         "num_samples": int(pred_scaled.shape[0]),
         "eval_clamp": bool(eval_clamp),
+        "eval_tile_size": int(tile_size),
+        "eval_tile_overlap": int(tile_overlap),
     }
+
+    z_diagnostics = aggregate_z_diagnostics(z_diag_records)
+    if z_diagnostics:
+        metrics["z_diagnostics"] = z_diagnostics
 
     if out_dir is not None:
         with open(os.path.join(out_dir, metrics_filename), "w") as f:
             json.dump(metrics, f, indent=2)
+        if z_diagnostics:
+            with open(os.path.join(out_dir, "rssm_hz_z_diagnostics.json"), "w") as f:
+                json.dump(z_diagnostics, f, indent=2)
 
     return metrics
 
 
-def evaluate(model, config, device, out_dir, test_path=None, max_test_samples=None, eval_clamp=False, export_preds=False):
+def _tile_starts(length, tile_size, step):
+    if tile_size >= length:
+        return [0]
+    starts = list(range(0, max(length - tile_size + 1, 1), step))
+    last = length - tile_size
+    if starts[-1] != last:
+        starts.append(last)
+    return starts
+
+
+def tiled_forward(model, pan, ms, lms, tile_size, tile_overlap):
+    """Run a full-resolution sample through the model by high-res tiles.
+
+    GF2/QB train/val patches are 64x64 while their test samples are 256x256.
+    Tiled inference lets us test whether RSSM-HZ prefers the training spatial
+    scale without changing the learned model. Tile starts are kept /4 aligned
+    so PAN/LMS crops match the corresponding LRMS crop exactly.
+    """
+    _, _, height, width = pan.shape
+    if tile_size <= 0 or (tile_size >= height and tile_size >= width):
+        out, kl, z_residuals = model(pan, ms, lms)
+        return out, kl, z_residuals
+    if tile_size % 4 != 0 or tile_overlap % 4 != 0:
+        raise ValueError("--eval-tile-size and --eval-tile-overlap must be divisible by 4")
+    if tile_overlap < 0 or tile_overlap >= tile_size:
+        raise ValueError("--eval-tile-overlap must satisfy 0 <= overlap < tile_size")
+
+    step = tile_size - tile_overlap
+    ys = _tile_starts(height, tile_size, step)
+    xs = _tile_starts(width, tile_size, step)
+    accum = pan.new_zeros(pan.shape[0], lms.shape[1], height, width)
+    weight = pan.new_zeros(1, 1, height, width)
+    kl_terms = []
+
+    for y in ys:
+        y2 = y + tile_size
+        my, my2 = y // 4, y2 // 4
+        for x in xs:
+            x2 = x + tile_size
+            mx, mx2 = x // 4, x2 // 4
+            out_tile, kl_tile, _ = model(
+                pan[:, :, y:y2, x:x2],
+                ms[:, :, my:my2, mx:mx2],
+                lms[:, :, y:y2, x:x2],
+            )
+            accum[:, :, y:y2, x:x2] += out_tile
+            weight[:, :, y:y2, x:x2] += 1.0
+            kl_terms.append(kl_tile.detach())
+
+    out = accum / weight.clamp_min(1.0)
+    kl = torch.stack(kl_terms).mean() if kl_terms else out.new_tensor(0.0)
+    return out, kl, None
+
+
+def evaluate(model, config, device, out_dir, test_path=None, max_test_samples=None, eval_clamp=False,
+             export_preds=False, q_win_size=8, collect_z_diagnostics=False, tile_size=0, tile_overlap=0):
     if test_path is None:
         test_path = os.path.join("Dataset", "WV3", "test_wv3_multiExm1.h5")
     return evaluate_dataset(
@@ -454,6 +654,10 @@ def evaluate(model, config, device, out_dir, test_path=None, max_test_samples=No
         max_samples=max_test_samples,
         eval_clamp=eval_clamp,
         export_preds=export_preds,
+        q_win_size=q_win_size,
+        tile_size=tile_size,
+        tile_overlap=tile_overlap,
+        collect_z_diagnostics=collect_z_diagnostics,
         batch_size=1,
         num_workers=0,
     )
@@ -517,7 +721,7 @@ def main():
     parser.add_argument("--lr-scale", type=float, default=1.0, help="Global LR scale for cautious finetuning")
     parser.add_argument(
         "--phase-b-freeze-mode",
-        choices=["none", "shallow", "state_high", "state_gate_head", "fusion_only"],
+        choices=["none", "shallow", "state_high", "state_gate_head", "fusion_only", "head_only"],
         default="none",
         help="Optional parameter freezing strategy used in phase b",
     )
@@ -529,8 +733,28 @@ def main():
                         help="Use 2D ConvGRU instead of per-pixel GRUCell for state updates")
     parser.add_argument("--learnable-fusion", action="store_true", default=False,
                         help="Replace additive PAN injection with learnable ConvFusion blocks")
+    parser.add_argument("--residual-learnable-fusion", action="store_true", default=False,
+                        help="Use ConvFusion as a zero-init residual correction on top of gated PAN injection")
+    parser.add_argument("--signed-hf-gate", action="store_true", default=False,
+                        help="Add a signed correction to the pretrained positive high-frequency gate")
+    parser.add_argument("--hf-gate-scale", type=float, default=1.0,
+                        help="Scale applied to high-frequency PAN injection gates")
     parser.add_argument("--image-space-wavelet", action="store_true", default=False,
                         help="Perform wavelet decomposition on raw images instead of feature maps")
+    parser.add_argument("--use-lowfreq-corr", action="store_true", default=False,
+                        help="Enable zero-init low-frequency/spectral correction head before residual output")
+    parser.add_argument("--use-sdem-lite", action="store_true", default=False,
+                        help="Enable zero-init lightweight PAN spatial detail enhancement before output reduction")
+    parser.add_argument("--use-state-spatial-mixer", action="store_true", default=False,
+                        help="Enable zero-init local spatial mixer on recurrent hidden states")
+    parser.add_argument("--use-level-ll-corr", action="store_true", default=False,
+                        help="Enable zero-init per-level LL/spectral correction before IDWT")
+    parser.add_argument("--use-band-corr", action="store_true", default=False,
+                        help="Enable zero-init per-band spectral correction head before output activation")
+    parser.add_argument("--band-corr-kernel-size", type=int, default=5,
+                        help="Depthwise kernel size for per-band spectral correction")
+    parser.add_argument("--band-corr-hidden", type=int, default=32,
+                        help="Hidden channels for per-band spectral correction")
     parser.add_argument("--distill-weight", type=float, default=0.0,
                         help="Weight for knowledge distillation loss (L1 between student and teacher outputs)")
     parser.add_argument("--teacher-ckpt", type=str, default="checkpoints/WFANet_best.pth",
@@ -538,6 +762,7 @@ def main():
     parser.add_argument("--w-sam", type=float, default=0.08)
     parser.add_argument("--w-edge", type=float, default=0.05)
     parser.add_argument("--w-wavelet-hf", type=float, default=0.08)
+    parser.add_argument("--w-ll", type=float, default=0.0, help="Multi-level wavelet LL loss weight")
     parser.add_argument("--w-ssim", type=float, default=0.0, help="SSIM loss weight")
     parser.add_argument("--w-kl", type=float, default=5e-5)
     parser.add_argument(
@@ -549,6 +774,14 @@ def main():
         help="Level weights for 3-level wavelet HF supervision from fine to coarse",
     )
     parser.add_argument("--eval-clamp", action="store_true", help="Clamp predictions to [0,1] before evaluation/export")
+    parser.add_argument("--no-loss-clamp", action="store_true",
+                        help="Use raw predictions for training losses; evaluation clamp remains controlled by --eval-clamp")
+    parser.add_argument("--q-win-size", type=int, default=8,
+                        help="Window size for Q metric. Use 8 for WV3/PanScale comparability, 4 for GF2/QB Q4.")
+    parser.add_argument("--eval-tile-size", type=int, default=0,
+                        help="Optional high-resolution tile size for final/eval-only inference; 0 disables tiling.")
+    parser.add_argument("--eval-tile-overlap", type=int, default=0,
+                        help="High-resolution overlap for tiled inference; must be divisible by 4.")
     parser.add_argument("--export-eval-preds", action="store_true", help="Export per-sample pred_XX.mat files for MATLAB-style evaluation")
     parser.add_argument("--use-ema", action="store_true", help="Track an EMA copy of model weights")
     parser.add_argument("--ema-decay", type=float, default=0.999, help="EMA decay")
@@ -559,6 +792,8 @@ def main():
     parser.add_argument("--max-val-samples", type=int, default=None, help="Optional cap on validation samples")
     parser.add_argument("--val-batch-size", type=int, default=32, help="Validation batch size")
     parser.add_argument("--val-num-workers", type=int, default=0, help="Validation dataloader workers")
+    parser.add_argument("--eval-only", action="store_true",
+                        help="Load a checkpoint and run final evaluation without training")
     parser.add_argument(
         "--best-metric",
         choices=["loss", "psnr", "q8", "sam", "ergas", "overall"],
@@ -570,7 +805,36 @@ def main():
     parser.add_argument("--best-sam-weight", type=float, default=1.0)
     parser.add_argument("--best-ergas-weight", type=float, default=1.0)
     parser.add_argument("--save-every", type=int, default=20)
+    parser.add_argument("--z-eval-mode", choices=["prior", "posterior", "zero"], default="prior",
+                        help="Eval-time z source in hz mode: prior mean, posterior mean from PAN/MS obs, or zero")
+    parser.add_argument("--z-update-order", choices=["legacy", "innovation"], default="legacy",
+                        help="legacy: GRU sees obs and previous z before current z; innovation: current z is inferred before GRU")
+    parser.add_argument("--z-zero-levels", nargs="*", type=int, default=None,
+                        help="Optional DWT levels whose z is forced to zero, e.g. 2 or 1 0")
+    parser.add_argument("--collect-z-diagnostics", action="store_true",
+                        help="During final eval, save per-level z magnitude and z-vs-zero LL/HF gate deltas")
+    parser.add_argument("--augment-geometric", action="store_true",
+                        help="Apply random hflip/vflip/rot90 to gt/pan/ms/lms during training")
+    parser.add_argument("--use-z-residual-head", action="store_true",
+                        help="Enable per-level z residual prediction heads")
+    parser.add_argument("--w-z-res-ll", type=float, default=0.03,
+                        help="Weight for z residual LL loss")
+    parser.add_argument("--w-z-res-hf", type=float, default=0.01,
+                        help="Weight for z residual HF loss")
+    parser.add_argument("--use-local-frequency-mixer", action="store_true",
+                        help="Enable zero-init local frequency residual mixers for LH/HL/HH")
+    parser.add_argument("--lfm-kernel-size", type=int, default=3,
+                        help="Depthwise kernel size for local frequency mixer")
+    parser.add_argument("--lfm-hidden-scale", type=float, default=1.0,
+                        help="Hidden channel scale for local frequency mixer")
+    parser.add_argument("--w-mse", type=float, default=0.0,
+                        help="Optional MSE loss weight for PSNR-oriented finetuning")
+    parser.add_argument("--w-band-balanced", type=float, default=0.0,
+                        help="Optional per-band normalized L1 loss weight")
     args = parser.parse_args()
+
+    if args.residual_learnable_fusion:
+        args.learnable_fusion = True
 
     if args.phase == "a":
         args.state_mode = "h"
@@ -611,7 +875,24 @@ def main():
         separate_subband_gates=separate_subband,
         use_conv_gru=args.use_conv_gru,
         learnable_fusion=args.learnable_fusion,
+        signed_hf_gate=args.signed_hf_gate,
+        hf_gate_scale=args.hf_gate_scale,
+        residual_learnable_fusion=args.residual_learnable_fusion,
         image_space_wavelet=args.image_space_wavelet,
+        use_lowfreq_corr=args.use_lowfreq_corr,
+        use_sdem_lite=args.use_sdem_lite,
+        use_state_spatial_mixer=args.use_state_spatial_mixer,
+        use_level_ll_corr=args.use_level_ll_corr,
+        use_band_corr=args.use_band_corr,
+        band_corr_kernel_size=args.band_corr_kernel_size,
+        band_corr_hidden=args.band_corr_hidden,
+        z_eval_mode=args.z_eval_mode,
+        z_update_order=args.z_update_order,
+        z_zero_levels=args.z_zero_levels,
+        use_z_residual_head=args.use_z_residual_head,
+        use_local_freq_mixer=args.use_local_frequency_mixer,
+        lfm_kernel_size=args.lfm_kernel_size,
+        lfm_hidden_scale=args.lfm_hidden_scale,
     ).to(device)
 
     # If training fresh, zero-init ms_upsample + fused_weight for LMS-start.
@@ -667,6 +948,37 @@ def main():
             best_loss = float(resume_obj["best_loss"])
         if isinstance(resume_obj, dict) and "best_val_score" in resume_obj:
             best_val_score = float(resume_obj["best_val_score"])
+
+    if hasattr(model, "set_z_eval_mode"):
+        model.set_z_eval_mode(args.z_eval_mode)
+
+    if args.eval_only:
+        print(
+            f"eval_only run_tag={run_tag} device={device} state_mode={args.state_mode} "
+            f"z_eval_mode={args.z_eval_mode} z_update_order={args.z_update_order} "
+            f"z_zero_levels={args.z_zero_levels}"
+        )
+        metrics = evaluate(
+            model,
+            config,
+            device,
+            eval_dir,
+            test_path=args.test_path,
+            max_test_samples=args.max_test_samples,
+            eval_clamp=args.eval_clamp,
+            export_preds=args.export_eval_preds,
+            q_win_size=args.q_win_size,
+            collect_z_diagnostics=args.collect_z_diagnostics,
+            tile_size=args.eval_tile_size,
+            tile_overlap=args.eval_tile_overlap,
+        )
+        print("===== eval only =====")
+        for k, v in metrics.items():
+            if k == "z_diagnostics":
+                print(f"{k}: saved to {os.path.join(eval_dir, 'rssm_hz_z_diagnostics.json')}")
+            else:
+                print(f"{k}: {v}")
+        return
 
     frozen_names = []
     if args.phase == "b" and args.phase_b_freeze_mode != "none":
@@ -730,7 +1042,11 @@ def main():
             f"best_metric={args.best_metric} max_val_samples={args.max_val_samples}"
         )
 
-    history = {"total": [], "l1": [], "sam": [], "edge": [], "wave": [], "ssim": [], "distill": [], "kl": []}
+    history = {
+        "total": [], "l1": [], "mse": [], "band": [], "sam": [], "edge": [],
+        "wave": [], "ll": [], "ssim": [], "distill": [], "kl": [],
+        "z_res_ll": [], "z_res_hf": []
+    }
 
     # ---- Load WFANet teacher for distillation ----
     teacher = None
@@ -754,7 +1070,9 @@ def main():
 
     print(
         f"run_tag={run_tag} device={device} epochs={epochs} batch_size={batch_size} "
-        f"state_mode={args.state_mode} phase={args.phase} distill_weight={args.distill_weight}"
+        f"state_mode={args.state_mode} phase={args.phase} distill_weight={args.distill_weight} "
+        f"z_eval_mode={args.z_eval_mode} z_update_order={args.z_update_order} z_zero_levels={args.z_zero_levels} "
+        f"use_lfm={args.use_local_frequency_mixer} w_mse={args.w_mse} w_band={args.w_band_balanced}"
     )
 
     for epoch in range(start_epoch, epochs):
@@ -781,11 +1099,16 @@ def main():
 
         total_meter = 0.0
         l1_meter = 0.0
+        mse_meter = 0.0
+        band_meter = 0.0
         sam_meter = 0.0
         edge_meter = 0.0
         wave_meter = 0.0
+        ll_meter = 0.0
         ssim_meter = 0.0
         distill_meter = 0.0
+        z_res_ll_meter = 0.0
+        z_res_hf_meter = 0.0
         kl_meter = 0.0
         bad_step_count = 0
 
@@ -804,9 +1127,47 @@ def main():
             ms = ms.to(device, non_blocking=True)
             lms = lms.to(device, non_blocking=True)
 
+            # Geometric augmentation: apply same hflip/vflip/rot90 to all four tensors
+            if args.augment_geometric:
+                if torch.rand(1).item() < 0.5:
+                    gt = gt.flip(-1)
+                    pan = pan.flip(-1)
+                    ms = ms.flip(-1)
+                    lms = lms.flip(-1)
+                if torch.rand(1).item() < 0.5:
+                    gt = gt.flip(-2)
+                    pan = pan.flip(-2)
+                    ms = ms.flip(-2)
+                    lms = lms.flip(-2)
+                k = torch.randint(0, 4, (1,)).item()
+                if k > 0:
+                    gt = torch.rot90(gt, k, [-2, -1])
+                    pan = torch.rot90(pan, k, [-2, -1])
+                    ms = torch.rot90(ms, k, [-2, -1])
+                    lms = torch.rot90(lms, k, [-2, -1])
+
             optimizer.zero_grad(set_to_none=True)
 
-            pred_raw, kl_loss = model(pan, ms, lms)
+            pred_raw, kl_loss, z_residuals = model(pan, ms, lms)
+            loss_z_res_ll = pred_raw.new_tensor(0.0)
+            loss_z_res_hf = pred_raw.new_tensor(0.0)
+            if args.use_z_residual_head and z_residuals is not None and model.training:
+                # Compute GT wavelet targets in feature space (32ch per subband)
+                gt_feat = model.ms_raise(gt)
+                lms_feat = model.ms_raise(lms)
+                gt_pyr = model.wavelet(gt_feat)
+                lms_pyr = model.wavelet(lms_feat)
+                # z_residuals is [coarsest, ..., finest], gt_pyr is [finest, ..., coarsest]
+                levels = len(z_residuals)
+                for i, (r_ll, r_lh, r_hl, r_hh) in enumerate(z_residuals):
+                    g_ll, g_lh, g_hl, g_hh = gt_pyr[levels - 1 - i]
+                    l_ll, l_lh, l_hl, l_hh = lms_pyr[levels - 1 - i]
+                    loss_z_res_ll = loss_z_res_ll + F.l1_loss(r_ll, g_ll - l_ll)
+                    loss_z_res_hf = loss_z_res_hf + (
+                        F.l1_loss(r_lh, g_lh - l_lh) +
+                        F.l1_loss(r_hl, g_hl - l_hl) +
+                        F.l1_loss(r_hh, g_hh - l_hh)
+                    ) / 3.0
             if (not torch.isfinite(pred_raw).all()) or (not torch.isfinite(kl_loss)):
                 bad_step_count += 1
                 model.load_state_dict(last_good_state)
@@ -815,11 +1176,20 @@ def main():
                     g["lr"] = max(g["lr"] * 0.5, 1e-6)
                 continue
 
-            pred = pred_raw.clamp(0.0, 1.0)
+            pred = pred_raw if args.no_loss_clamp else pred_raw.clamp(0.0, 1.0)
             loss_l1 = l1_loss(pred, gt)
-            loss_sam = sam_loss(pred, gt)
-            loss_edge = l1_loss(sobel_edges(pred), sobel_edges(gt))
-            loss_wave = wavelet_hf_loss_multilevel(pred, gt, dwt_loss, l1_loss, args.wavelet_level_weights)
+            loss_mse = F.mse_loss(pred, gt) if args.w_mse > 0 else pred.new_tensor(0.0)
+            loss_band = band_balanced_l1_loss(pred, gt) if args.w_band_balanced > 0 else pred.new_tensor(0.0)
+            loss_sam = sam_loss(pred, gt) if args.w_sam > 0 else pred.new_tensor(0.0)
+            loss_edge = l1_loss(sobel_edges(pred), sobel_edges(gt)) if args.w_edge > 0 else pred.new_tensor(0.0)
+            loss_wave = (
+                wavelet_hf_loss_multilevel(pred, gt, dwt_loss, l1_loss, args.wavelet_level_weights)
+                if args.w_wavelet_hf > 0 else pred.new_tensor(0.0)
+            )
+            loss_ll = (
+                wavelet_ll_loss_multilevel(pred, gt, dwt_loss, l1_loss, args.wavelet_level_weights)
+                if args.w_ll > 0 else pred.new_tensor(0.0)
+            )
             loss_ssim = ssim_loss(pred, gt) if args.w_ssim > 0 else pred.new_tensor(0.0)
 
             loss_distill = pred.new_tensor(0.0)
@@ -832,11 +1202,16 @@ def main():
             loss = (
                 loss_l1
                 + args.w_sam * loss_sam
+                + args.w_mse * loss_mse
+                + args.w_band_balanced * loss_band
                 + args.w_edge * loss_edge
                 + args.w_wavelet_hf * loss_wave
+                + args.w_ll * loss_ll
                 + args.w_ssim * loss_ssim
                 + args.distill_weight * loss_distill
                 + kl_beta * kl_safe
+                + args.w_z_res_ll * loss_z_res_ll
+                + args.w_z_res_hf * loss_z_res_hf
             )
 
             if not torch.isfinite(loss):
@@ -867,29 +1242,42 @@ def main():
 
             total_meter += loss.item()
             l1_meter += loss_l1.item()
+            mse_meter += loss_mse.item()
+            band_meter += loss_band.item()
             sam_meter += loss_sam.item()
             edge_meter += loss_edge.item()
             wave_meter += loss_wave.item()
+            ll_meter += loss_ll.item()
             ssim_meter += loss_ssim.item()
             distill_meter += loss_distill.item()
             kl_meter += kl_safe.item()
+            z_res_ll_meter += loss_z_res_ll.item()
+            z_res_hf_meter += loss_z_res_hf.item()
 
         steps_done = step + 1
         avg_total = total_meter / max(1, steps_done)
         avg_l1 = l1_meter / max(1, steps_done)
+        avg_mse = mse_meter / max(1, steps_done)
+        avg_band = band_meter / max(1, steps_done)
         avg_sam = sam_meter / max(1, steps_done)
         avg_edge = edge_meter / max(1, steps_done)
         avg_wave = wave_meter / max(1, steps_done)
+        avg_ll = ll_meter / max(1, steps_done)
         avg_ssim = ssim_meter / max(1, steps_done)
         avg_distill = distill_meter / max(1, steps_done)
         avg_kl = kl_meter / max(1, steps_done)
 
         history["total"].append(avg_total)
         history["l1"].append(avg_l1)
+        history["mse"].append(avg_mse)
+        history["band"].append(avg_band)
         history["sam"].append(avg_sam)
         history["edge"].append(avg_edge)
         history["wave"].append(avg_wave)
+        history["ll"].append(avg_ll)
         history["ssim"].append(avg_ssim)
+        history["z_res_ll"].append(z_res_ll_meter / max(1, steps_done))
+        history["z_res_hf"].append(z_res_hf_meter / max(1, steps_done))
         history["distill"].append(avg_distill)
         history["kl"].append(avg_kl)
 
@@ -920,6 +1308,7 @@ def main():
                 export_preds=False,
                 batch_size=args.val_batch_size,
                 num_workers=args.val_num_workers,
+                q_win_size=args.q_win_size,
             )
             raw_score = compute_metric_score(raw_metrics, args)
             selected_source = "raw"
@@ -942,6 +1331,7 @@ def main():
                     export_preds=False,
                     batch_size=args.val_batch_size,
                     num_workers=args.val_num_workers,
+                    q_win_size=args.q_win_size,
                 )
                 ema_score = compute_metric_score(ema_metrics, args)
                 if ema_score > selected_score:
@@ -969,7 +1359,7 @@ def main():
             print(
                 f"val epoch {epoch + 1:03d}: source={selected_source} score={selected_score:.6f} "
                 f"PSNR={selected_metrics['PSNR']:.6f} SAM={selected_metrics['SAM']:.6f} "
-                f"ERGAS={selected_metrics['ERGAS']:.6f} Q8={selected_metrics['Q8']:.6f}"
+                f"ERGAS={selected_metrics['ERGAS']:.6f} Q{args.q_win_size}={selected_metrics['Q8']:.6f}"
             )
 
             if selected_score > best_val_score:
@@ -1013,8 +1403,9 @@ def main():
         dt = time.time() - t0
         print(
             f"epoch {epoch + 1:03d}/{epochs} "
-            f"loss={avg_total:.6f} l1={avg_l1:.6f} sam={avg_sam:.6f} "
-            f"edge={avg_edge:.6f} wave={avg_wave:.6f} ssim={avg_ssim:.6f} distill={avg_distill:.6f} kl={avg_kl:.6f} bad_steps={bad_step_count} "
+            f"loss={avg_total:.6f} l1={avg_l1:.6f} mse={avg_mse:.6f} band={avg_band:.6f} sam={avg_sam:.6f} "
+            f"edge={avg_edge:.6f} wave={avg_wave:.6f} ll={avg_ll:.6f} "
+            f"ssim={avg_ssim:.6f} distill={avg_distill:.6f} kl={avg_kl:.6f} bad_steps={bad_step_count} "
             f"beta={kl_beta:.6e} lr={lr:.3e} time={dt:.1f}s"
         )
 
@@ -1035,10 +1426,17 @@ def main():
         max_test_samples=args.max_test_samples,
         eval_clamp=args.eval_clamp,
         export_preds=args.export_eval_preds,
+        q_win_size=args.q_win_size,
+        collect_z_diagnostics=args.collect_z_diagnostics,
+        tile_size=args.eval_tile_size,
+        tile_overlap=args.eval_tile_overlap,
     )
     print("===== final eval =====")
     for k, v in metrics.items():
-        print(f"{k}: {v}")
+        if k == "z_diagnostics":
+            print(f"{k}: saved to {os.path.join(eval_dir, 'rssm_hz_z_diagnostics.json')}")
+        else:
+            print(f"{k}: {v}")
 
 
 if __name__ == "__main__":

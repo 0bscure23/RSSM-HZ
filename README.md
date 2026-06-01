@@ -8,6 +8,14 @@ The project is still under active experimentation. The strongest current evidenc
 
 See [CURRENT_STATUS.md](CURRENT_STATUS.md) for the latest experiment summary, open issues, and next steps.
 
+For the GF2/QB innovation-z update and lightweight metric files, see
+[docs/experiment_results_20260601.md](docs/experiment_results_20260601.md).
+
+Note: experimental modules such as `BandAwareCorrection` are zero-initialized
+and disabled by default. They are included for reproducibility of current
+ablation work, but only the innovation-z results in the snapshot are treated as
+confirmed improvements.
+
 ## Quick Start
 
 ```bash
