@@ -496,6 +496,28 @@ def apply_phase_b_freeze(model, freeze_mode):
             names.append("fused_weight")
         return names
 
+    if freeze_mode == "gate_head_reduce":
+        for param in model.parameters():
+            param.requires_grad = False
+
+        trainable_modules = [
+            ("rssm_fusion.pan_high_to_ms", model.rssm_fusion.pan_high_to_ms),
+            *gate_modules,
+            ("rssm_fusion.z_to_gate", model.rssm_fusion.z_to_gate),
+            ("reduce", model.reduce),
+            *lowfreq_modules,
+            ("out_act", model.out_act),
+        ]
+        for _, module in trainable_modules:
+            for param in module.parameters():
+                param.requires_grad = True
+        if hasattr(model, "fused_weight"):
+            model.fused_weight.requires_grad = True
+        names = [name for name, _ in trainable_modules]
+        if hasattr(model, "fused_weight"):
+            names.append("fused_weight")
+        return names
+
     raise ValueError(f"Unsupported freeze mode: {freeze_mode}")
 
 
@@ -743,7 +765,7 @@ def main():
     parser.add_argument("--lr-scale", type=float, default=1.0, help="Global LR scale for cautious finetuning")
     parser.add_argument(
         "--phase-b-freeze-mode",
-        choices=["none", "shallow", "state_high", "state_gate_head", "fusion_only", "head_only", "head_reduce"],
+        choices=["none", "shallow", "state_high", "state_gate_head", "fusion_only", "head_only", "head_reduce", "gate_head_reduce"],
         default="none",
         help="Optional parameter freezing strategy used in phase b",
     )

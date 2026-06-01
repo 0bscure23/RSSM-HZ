@@ -74,6 +74,7 @@ Follow-up WIP added after the first head-only probe:
 - `launch_level_ll_state_focus_20260601.sh` keeps only the two most promising state-level variants active: GF2 L1 and QB SAM+LL.
 - `launch_level_ll_state_from_reduce_20260601.sh` starts state-level fine-tuning from the improved per-level-LL reduce checkpoints instead of the older innovation-z checkpoints.
 - `launch_level_ll_reduce_continue_20260601.sh` continues the safer per-level-LL reduce route from the best validation checkpoints and compares L1-only against mild MSE/band-balanced variants.
+- `gate_head_reduce` freeze mode and `launch_gate_head_reduce_20260601.sh` are the next middle-strength attempt: they tune PAN high-frequency projection/gates plus low-frequency/output heads while keeping recurrent state updates frozen.
 - These variants still use only convolutional/local operations and keep the intended linear-complexity advantage over WFANet-style global attention.
 
 ## Uploaded Lightweight Metric JSONs
