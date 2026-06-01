@@ -65,6 +65,13 @@ Early probe:
 
 The WIP code is included because it is zero-initialized and disabled by default, but it should not be claimed as a final improvement until the running 80-epoch experiments finish.
 
+Follow-up WIP added after the first head-only probe:
+
+- `head_reduce` freeze mode trains `reduce + band_corr + out_act + fused_weight`, allowing the 32-channel fused representation to be remapped to the four GF2/QB bands while keeping the recurrent backbone frozen.
+- `launch_headreduce_round_20260601.sh` runs GF2/QB with head-reduce using L1-only and SAM+LL variants.
+- `launch_level_ll_round_20260601.sh` additionally enables per-level `LevelLLCorrection`, so low-frequency/spectral bias can be corrected before hierarchical IDWT instead of only at the final output.
+- These variants still use only convolutional/local operations and keep the intended linear-complexity advantage over WFANet-style global attention.
+
 ## Uploaded Lightweight Metric JSONs
 
 ```text

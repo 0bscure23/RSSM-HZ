@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /ssd2/lizhy_workspace/plp/WFANet
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+cd "$SCRIPT_DIR"
 mkdir -p output_log /ssd2/lizhy_workspace/tmp/wfanet_tmp
 export TMPDIR=/ssd2/lizhy_workspace/tmp/wfanet_tmp
 export TEMP="$TMPDIR"
@@ -19,25 +20,23 @@ COMMON=(
   --z-eval-mode posterior
   --hidden-dim 128
   --latent-dim 48
-  --epochs 80
+  --epochs 60
   --batch-size 32
   --num-workers 0
   --val-every 10
   --val-batch-size 8
   --best-metric overall
   --q-win-size 4
-  --w-sam 0
   --w-edge 0
   --w-wavelet-hf 0
-  --w-ll 0
   --w-kl 0
-  --phase-b-freeze-mode head_only
-  --phase-b-lr-scale 0.5
+  --phase-b-freeze-mode head_reduce
+  --phase-b-lr-scale 0.25
   --phase-b-ramp-epochs 1
   --no-loss-clamp
   --use-band-corr
-  --band-corr-kernel-size 5
-  --band-corr-hidden 32
+  --band-corr-kernel-size 7
+  --band-corr-hidden 64
   --save-every 999
 )
 
@@ -56,27 +55,31 @@ QB=(
 )
 
 "${PY_CMD[@]}" --gpu 0 "${COMMON[@]}" "${GF2[@]}" \
-  --run-tag gf2_bandcorr_head_l1_80ep \
-  > output_log/gf2_bandcorr_head_l1_20260601.log 2>&1 &
-echo "started gf2_bandcorr_head_l1_80ep pid=$!"
+  --w-sam 0 \
+  --w-ll 0 \
+  --run-tag gf2_bandcorr_reduce_l1_60ep \
+  > output_log/gf2_bandcorr_reduce_l1_20260601.log 2>&1 &
+echo "started gf2_bandcorr_reduce_l1_60ep pid=$!"
 
 "${PY_CMD[@]}" --gpu 1 "${COMMON[@]}" "${QB[@]}" \
-  --run-tag qb_bandcorr_head_l1_80ep \
-  > output_log/qb_bandcorr_head_l1_20260601.log 2>&1 &
-echo "started qb_bandcorr_head_l1_80ep pid=$!"
+  --w-sam 0 \
+  --w-ll 0 \
+  --run-tag qb_bandcorr_reduce_l1_60ep \
+  > output_log/qb_bandcorr_reduce_l1_20260601.log 2>&1 &
+echo "started qb_bandcorr_reduce_l1_60ep pid=$!"
 
 "${PY_CMD[@]}" --gpu 2 "${COMMON[@]}" "${GF2[@]}" \
-  --w-mse 50 \
-  --w-band-balanced 0.02 \
-  --run-tag gf2_bandcorr_head_mseband_80ep \
-  > output_log/gf2_bandcorr_head_mseband_20260601.log 2>&1 &
-echo "started gf2_bandcorr_head_mseband_80ep pid=$!"
+  --w-sam 0.02 \
+  --w-ll 0.03 \
+  --run-tag gf2_bandcorr_reduce_samll_60ep \
+  > output_log/gf2_bandcorr_reduce_samll_20260601.log 2>&1 &
+echo "started gf2_bandcorr_reduce_samll_60ep pid=$!"
 
 "${PY_CMD[@]}" --gpu 3 "${COMMON[@]}" "${QB[@]}" \
-  --w-mse 50 \
-  --w-band-balanced 0.02 \
-  --run-tag qb_bandcorr_head_mseband_80ep \
-  > output_log/qb_bandcorr_head_mseband_20260601.log 2>&1 &
-echo "started qb_bandcorr_head_mseband_80ep pid=$!"
+  --w-sam 0.02 \
+  --w-ll 0.03 \
+  --run-tag qb_bandcorr_reduce_samll_60ep \
+  > output_log/qb_bandcorr_reduce_samll_20260601.log 2>&1 &
+echo "started qb_bandcorr_reduce_samll_60ep pid=$!"
 
 wait
