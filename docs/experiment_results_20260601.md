@@ -70,6 +70,7 @@ Follow-up WIP added after the first head-only probe:
 - `head_reduce` freeze mode trains `reduce + band_corr + out_act + fused_weight`, allowing the 32-channel fused representation to be remapped to the four GF2/QB bands while keeping the recurrent backbone frozen.
 - `launch_headreduce_round_20260601.sh` runs GF2/QB with head-reduce using L1-only and SAM+LL variants.
 - `launch_level_ll_round_20260601.sh` additionally enables per-level `LevelLLCorrection`, so low-frequency/spectral bias can be corrected before hierarchical IDWT instead of only at the final output.
+- `launch_level_ll_state_round_20260601.sh` is the stronger follow-up: it keeps shallow encoders frozen but fine-tunes recurrent fusion blocks, gates, per-level LL correction, and output heads with a small LR.
 - These variants still use only convolutional/local operations and keep the intended linear-complexity advantage over WFANet-style global attention.
 
 ## Uploaded Lightweight Metric JSONs
