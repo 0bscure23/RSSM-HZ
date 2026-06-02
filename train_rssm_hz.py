@@ -227,6 +227,43 @@ def wavelet_ll_loss_multilevel(pred, gt, dwt_module, l1_loss, level_weights):
     return loss / weight_sum
 
 
+def wavelet_frequency_consistency_loss(pred, gt, dwt_module, l1_loss, level_weights):
+    """Joint LL/HF frequency consistency loss from the doc blueprint."""
+    loss_hf = wavelet_hf_loss_multilevel(pred, gt, dwt_module, l1_loss, level_weights)
+    loss_ll = wavelet_ll_loss_multilevel(pred, gt, dwt_module, l1_loss, level_weights)
+    return 0.5 * (loss_hf + loss_ll)
+
+
+def manifold_preservation_loss(pred, pan, lms, pool_size=8):
+    """Low-dimensional manifold preservation regularizer.
+
+    The doc proposal asks the fused HRMS manifold to remain compatible with
+    PAN spatial structure and LMS spectral structure. We use a small pooled
+    affinity graph so the cost is bounded and independent from full image size.
+    """
+    size = int(pool_size)
+    pred_low = F.adaptive_avg_pool2d(pred, (size, size))
+    lms_low = F.adaptive_avg_pool2d(lms, (size, size))
+    pan_low = F.adaptive_avg_pool2d(pan, (size, size))
+    pred_luma = pred_low.mean(dim=1, keepdim=True)
+    lms_luma = lms_low.mean(dim=1, keepdim=True)
+
+    def affinity(x):
+        b, c, h, w = x.shape
+        feat = x.view(b, c, h * w).transpose(1, 2)
+        feat = F.normalize(feat - feat.mean(dim=1, keepdim=True), dim=-1, eps=1e-6)
+        return torch.bmm(feat, feat.transpose(1, 2))
+
+    pred_aff_spatial = affinity(pred_luma)
+    pan_aff = affinity(pan_low)
+    pred_aff_spectral = affinity(pred_low)
+    lms_aff = affinity(lms_low)
+    return 0.5 * (
+        F.l1_loss(pred_aff_spatial, pan_aff.detach()) +
+        F.l1_loss(pred_aff_spectral, lms_aff.detach())
+    )
+
+
 def save_prediction_mats(pred_scaled, out_dir):
     pred_dir = os.path.join(out_dir, "pred")
     os.makedirs(pred_dir, exist_ok=True)
@@ -437,6 +474,13 @@ def apply_phase_b_freeze(model, freeze_mode):
             ("rssm_fusion.mamba_mixer_lh", fusion.mamba_mixer_lh),
             ("rssm_fusion.mamba_mixer_hl", fusion.mamba_mixer_hl),
             ("rssm_fusion.mamba_mixer_hh", fusion.mamba_mixer_hh),
+        ])
+    if getattr(fusion, "use_doc_fmamba", False):
+        freq_modules.extend([
+            ("rssm_fusion.doc_state_mixer", fusion.doc_state_mixer),
+            ("rssm_fusion.doc_fmamba_lh", fusion.doc_fmamba_lh),
+            ("rssm_fusion.doc_fmamba_hl", fusion.doc_fmamba_hl),
+            ("rssm_fusion.doc_fmamba_hh", fusion.doc_fmamba_hh),
         ])
 
     if freeze_mode == "state_high":
@@ -914,6 +958,18 @@ def main():
                         help="Mamba local convolution width for frequency mixer")
     parser.add_argument("--mamba-expand", type=int, default=2,
                         help="Mamba expansion ratio for frequency mixer")
+    parser.add_argument("--use-doc-fmamba", action="store_true",
+                        help="Enable the full doc-inspired FMamba/WSLM blueprint modules")
+    parser.add_argument("--doc-window-size", type=int, default=8,
+                        help="Local window size for doc FMamba/WSLM modules")
+    parser.add_argument("--doc-hidden-scale", type=float, default=1.0,
+                        help="Hidden channel scale for doc FMamba modules")
+    parser.add_argument("--doc-mamba-d-state", type=int, default=16,
+                        help="Mamba state dimension for doc FMamba/WSLM")
+    parser.add_argument("--doc-mamba-d-conv", type=int, default=4,
+                        help="Mamba local convolution width for doc FMamba/WSLM")
+    parser.add_argument("--doc-mamba-expand", type=int, default=2,
+                        help="Mamba expansion ratio for doc FMamba/WSLM")
     parser.add_argument("--use-channel-dwt-adapter", action="store_true",
                         help="Enable 1D channel-wise Haar spectral adapter for MS_up")
     parser.add_argument("--channel-dwt-hidden", type=int, default=32,
@@ -922,6 +978,12 @@ def main():
                         help="Optional MSE loss weight for PSNR-oriented finetuning")
     parser.add_argument("--w-band-balanced", type=float, default=0.0,
                         help="Optional per-band normalized L1 loss weight")
+    parser.add_argument("--w-frequency", type=float, default=0.0,
+                        help="Joint multi-level wavelet LL/HF frequency consistency loss weight")
+    parser.add_argument("--w-mp", type=float, default=0.0,
+                        help="Manifold preservation loss weight against PAN/LMS affinity structure")
+    parser.add_argument("--mp-pool-size", type=int, default=8,
+                        help="Pooled spatial size used by manifold preservation loss")
     args = parser.parse_args()
 
     if args.residual_learnable_fusion:
@@ -993,6 +1055,12 @@ def main():
         mamba_d_state=args.mamba_d_state,
         mamba_d_conv=args.mamba_d_conv,
         mamba_expand=args.mamba_expand,
+        use_doc_fmamba=args.use_doc_fmamba,
+        doc_window_size=args.doc_window_size,
+        doc_hidden_scale=args.doc_hidden_scale,
+        doc_mamba_d_state=args.doc_mamba_d_state,
+        doc_mamba_d_conv=args.doc_mamba_d_conv,
+        doc_mamba_expand=args.doc_mamba_expand,
         use_channel_dwt_adapter=args.use_channel_dwt_adapter,
         channel_dwt_hidden=args.channel_dwt_hidden,
     ).to(device)
@@ -1146,7 +1214,7 @@ def main():
 
     history = {
         "total": [], "l1": [], "mse": [], "band": [], "sam": [], "edge": [],
-        "wave": [], "ll": [], "ssim": [], "distill": [], "kl": [],
+        "wave": [], "ll": [], "frequency": [], "mp": [], "ssim": [], "distill": [], "kl": [],
         "z_res_ll": [], "z_res_hf": []
     }
 
@@ -1175,7 +1243,9 @@ def main():
         f"state_mode={args.state_mode} phase={args.phase} distill_weight={args.distill_weight} "
         f"z_eval_mode={args.z_eval_mode} z_update_order={args.z_update_order} z_zero_levels={args.z_zero_levels} "
         f"use_lfm={args.use_local_frequency_mixer} use_wfm={args.use_windowed_frequency_mixer} "
-        f"use_chdwt={args.use_channel_dwt_adapter} w_mse={args.w_mse} w_band={args.w_band_balanced}"
+        f"use_mamba={args.use_mamba_frequency_mixer} use_doc_fmamba={args.use_doc_fmamba} "
+        f"use_chdwt={args.use_channel_dwt_adapter} w_mse={args.w_mse} w_band={args.w_band_balanced} "
+        f"w_frequency={args.w_frequency} w_mp={args.w_mp}"
     )
 
     for epoch in range(start_epoch, epochs):
@@ -1208,6 +1278,8 @@ def main():
         edge_meter = 0.0
         wave_meter = 0.0
         ll_meter = 0.0
+        freq_meter = 0.0
+        mp_meter = 0.0
         ssim_meter = 0.0
         distill_meter = 0.0
         z_res_ll_meter = 0.0
@@ -1293,6 +1365,14 @@ def main():
                 wavelet_ll_loss_multilevel(pred, gt, dwt_loss, l1_loss, args.wavelet_level_weights)
                 if args.w_ll > 0 else pred.new_tensor(0.0)
             )
+            loss_frequency = (
+                wavelet_frequency_consistency_loss(pred, gt, dwt_loss, l1_loss, args.wavelet_level_weights)
+                if args.w_frequency > 0 else pred.new_tensor(0.0)
+            )
+            loss_mp = (
+                manifold_preservation_loss(pred, pan, lms, pool_size=args.mp_pool_size)
+                if args.w_mp > 0 else pred.new_tensor(0.0)
+            )
             loss_ssim = ssim_loss(pred, gt) if args.w_ssim > 0 else pred.new_tensor(0.0)
 
             loss_distill = pred.new_tensor(0.0)
@@ -1310,6 +1390,8 @@ def main():
                 + args.w_edge * loss_edge
                 + args.w_wavelet_hf * loss_wave
                 + args.w_ll * loss_ll
+                + args.w_frequency * loss_frequency
+                + args.w_mp * loss_mp
                 + args.w_ssim * loss_ssim
                 + args.distill_weight * loss_distill
                 + kl_beta * kl_safe
@@ -1351,6 +1433,8 @@ def main():
             edge_meter += loss_edge.item()
             wave_meter += loss_wave.item()
             ll_meter += loss_ll.item()
+            freq_meter += loss_frequency.item()
+            mp_meter += loss_mp.item()
             ssim_meter += loss_ssim.item()
             distill_meter += loss_distill.item()
             kl_meter += kl_safe.item()
@@ -1366,6 +1450,8 @@ def main():
         avg_edge = edge_meter / max(1, steps_done)
         avg_wave = wave_meter / max(1, steps_done)
         avg_ll = ll_meter / max(1, steps_done)
+        avg_freq = freq_meter / max(1, steps_done)
+        avg_mp = mp_meter / max(1, steps_done)
         avg_ssim = ssim_meter / max(1, steps_done)
         avg_distill = distill_meter / max(1, steps_done)
         avg_kl = kl_meter / max(1, steps_done)
@@ -1378,6 +1464,8 @@ def main():
         history["edge"].append(avg_edge)
         history["wave"].append(avg_wave)
         history["ll"].append(avg_ll)
+        history["frequency"].append(avg_freq)
+        history["mp"].append(avg_mp)
         history["ssim"].append(avg_ssim)
         history["z_res_ll"].append(z_res_ll_meter / max(1, steps_done))
         history["z_res_hf"].append(z_res_hf_meter / max(1, steps_done))
@@ -1507,7 +1595,7 @@ def main():
         print(
             f"epoch {epoch + 1:03d}/{epochs} "
             f"loss={avg_total:.6f} l1={avg_l1:.6f} mse={avg_mse:.6f} band={avg_band:.6f} sam={avg_sam:.6f} "
-            f"edge={avg_edge:.6f} wave={avg_wave:.6f} ll={avg_ll:.6f} "
+            f"edge={avg_edge:.6f} wave={avg_wave:.6f} ll={avg_ll:.6f} freq={avg_freq:.6f} mp={avg_mp:.6f} "
             f"ssim={avg_ssim:.6f} distill={avg_distill:.6f} kl={avg_kl:.6f} bad_steps={bad_step_count} "
             f"beta={kl_beta:.6e} lr={lr:.3e} time={dt:.1f}s"
         )
