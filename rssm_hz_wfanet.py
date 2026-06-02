@@ -4,6 +4,11 @@ import torch.nn.functional as F
 
 from net_torch import DWT_2D, IDWT_2D, raise_channel, reduce_channel, resblock
 
+try:
+    from mamba_ssm.modules.mamba_simple import Mamba
+except Exception:
+    Mamba = None
+
 
 class WaveletPyramid(nn.Module):
     def __init__(self, levels=3):
@@ -500,6 +505,206 @@ class LocalFrequencyMixer(nn.Module):
         return self.scale * self.body(x)
 
 
+class ChannelHaarSpectralAdapter(nn.Module):
+    """1D channel-wise Haar adapter for the MS residual stream.
+
+    The report argues that MS bands should keep explicit spectral structure.
+    This module exposes pairwise low/high spectral responses while starting as
+    an exact no-op, so old checkpoints remain behaviorally unchanged at load.
+    """
+    def __init__(self, channels, hidden_channels=32):
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv2d(channels * 3 + 1, hidden_channels, 1, 1, 0, bias=True),
+            nn.PReLU(hidden_channels),
+            nn.Conv2d(hidden_channels, hidden_channels, 3, 1, 1, groups=hidden_channels, bias=True),
+            nn.PReLU(hidden_channels),
+            nn.Conv2d(hidden_channels, channels, 1, 1, 0, bias=True),
+        )
+        nn.init.zeros_(self.body[-1].weight)
+        if self.body[-1].bias is not None:
+            nn.init.zeros_(self.body[-1].bias)
+        self.scale = nn.Parameter(torch.ones(1))
+
+    @staticmethod
+    def channel_haar(x):
+        c = x.shape[1]
+        if c < 2:
+            return x
+        if c % 2 != 0:
+            # The known WV3/GF2/QB configs are even-channel, but keep a safe
+            # fallback so the module is not brittle for custom data.
+            x_pair = x[:, :-1]
+            tail = x[:, -1:]
+        else:
+            x_pair = x
+            tail = None
+        even = x_pair[:, 0::2]
+        odd = x_pair[:, 1::2]
+        scale = 2.0 ** -0.5
+        low = (even + odd) * scale
+        high = (even - odd) * scale
+        out = torch.cat([low, high], dim=1)
+        return torch.cat([out, tail], dim=1) if tail is not None else out
+
+    def forward(self, ms_up, lms, pan):
+        spectral = self.channel_haar(ms_up)
+        delta = self.body(torch.cat([ms_up, lms, spectral, pan], dim=1))
+        return ms_up + self.scale * delta
+
+
+class WindowedFrequencyMixer(nn.Module):
+    """Windowed selective-scan mixer for local frequency correction.
+
+    This is a dependency-free, linear-complexity proxy for the report's
+    WSLM/FMamba idea: it scans short local windows in frequency subbands and
+    predicts a zero-initialized residual correction.
+    """
+    def __init__(self, channels, window_size=8, hidden_scale=1.0):
+        super().__init__()
+        hidden = max(channels, int(round(channels * float(hidden_scale))))
+        self.window_size = int(window_size)
+        self.in_proj = nn.Conv2d(channels * 6, hidden * 3, 1, 1, 0, bias=True)
+        self.dw = nn.Conv2d(hidden, hidden, 3, 1, 1, groups=hidden, bias=True)
+        self.out_proj = nn.Conv2d(hidden, channels, 1, 1, 0, bias=True)
+        nn.init.zeros_(self.out_proj.weight)
+        if self.out_proj.bias is not None:
+            nn.init.zeros_(self.out_proj.bias)
+        self.scale = nn.Parameter(torch.ones(1))
+
+    def _window_flatten(self, x):
+        b, c, h, w = x.shape
+        ws = self.window_size
+        pad_h = (-h) % ws
+        pad_w = (-w) % ws
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+        hp, wp = x.shape[-2:]
+        x = x.view(b, c, hp // ws, ws, wp // ws, ws)
+        x = x.permute(0, 2, 4, 1, 3, 5).contiguous()
+        x = x.view(b * (hp // ws) * (wp // ws), c, ws * ws)
+        return x, (b, c, h, w, hp, wp)
+
+    def _window_unflatten(self, x, meta):
+        b, c, h, w, hp, wp = meta
+        ws = self.window_size
+        x = x.view(b, hp // ws, wp // ws, c, ws, ws)
+        x = x.permute(0, 3, 1, 4, 2, 5).contiguous()
+        x = x.view(b, c, hp, wp)
+        return x[:, :, :h, :w]
+
+    def _bidirectional_scan(self, value, decay):
+        v, meta = self._window_flatten(value)
+        d, _ = self._window_flatten(decay)
+        d = torch.sigmoid(d).clamp(0.02, 0.98)
+
+        state = torch.zeros(v.shape[0], v.shape[1], device=v.device, dtype=v.dtype)
+        forward = []
+        for idx in range(v.shape[-1]):
+            a = d[:, :, idx]
+            state = a * state + (1.0 - a) * v[:, :, idx]
+            forward.append(state)
+        forward = torch.stack(forward, dim=-1)
+
+        state = torch.zeros_like(state)
+        backward = []
+        for idx in range(v.shape[-1] - 1, -1, -1):
+            a = d[:, :, idx]
+            state = a * state + (1.0 - a) * v[:, :, idx]
+            backward.append(state)
+        backward = torch.stack(backward[::-1], dim=-1)
+        return self._window_unflatten(0.5 * (forward + backward), meta)
+
+    def forward(self, ms_hf, pan_hf, alpha, fused_ll, ms_ll):
+        alpha_pan = alpha * pan_hf
+        diff = (ms_hf - pan_hf).abs()
+        x = torch.cat([ms_hf, pan_hf, alpha_pan, diff, fused_ll, ms_ll], dim=1)
+        value, gate, decay = torch.chunk(self.in_proj(x), 3, dim=1)
+        value = self.dw(value)
+        mixed = self._bidirectional_scan(value, decay)
+        return self.scale * self.out_proj(mixed * torch.sigmoid(gate))
+
+
+class MambaFrequencyMixer(nn.Module):
+    """True Mamba-based window mixer for high-frequency residual correction.
+
+    The module mirrors WindowedFrequencyMixer's input/output contract but uses
+    mamba_ssm's selective scan inside each local window. It is intentionally
+    zero-initialized at the output projection, so enabling it starts as a no-op
+    residual path and preserves old checkpoints as much as possible.
+    """
+    def __init__(
+        self,
+        channels,
+        window_size=8,
+        hidden_scale=1.0,
+        d_state=16,
+        d_conv=4,
+        expand=2,
+        bidirectional=True,
+    ):
+        super().__init__()
+        if Mamba is None:
+            raise ImportError(
+                "mamba_ssm is required for --use-mamba-frequency-mixer. "
+                "Use the wfanet_mamba environment or disable this flag."
+            )
+        hidden = max(channels, int(round(channels * float(hidden_scale))))
+        self.window_size = int(window_size)
+        self.bidirectional = bool(bidirectional)
+        self.in_proj = nn.Sequential(
+            nn.Conv2d(channels * 6, hidden, 1, 1, 0, bias=True),
+            nn.PReLU(hidden),
+        )
+        self.norm = nn.LayerNorm(hidden)
+        self.mamba = Mamba(
+            d_model=hidden,
+            d_state=int(d_state),
+            d_conv=int(d_conv),
+            expand=int(expand),
+        )
+        self.out_proj = nn.Conv2d(hidden, channels, 1, 1, 0, bias=True)
+        nn.init.zeros_(self.out_proj.weight)
+        if self.out_proj.bias is not None:
+            nn.init.zeros_(self.out_proj.bias)
+        self.scale = nn.Parameter(torch.ones(1))
+
+    def _window_flatten(self, x):
+        b, c, h, w = x.shape
+        ws = max(1, self.window_size)
+        pad_h = (-h) % ws
+        pad_w = (-w) % ws
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+        hp, wp = x.shape[-2:]
+        x = x.view(b, c, hp // ws, ws, wp // ws, ws)
+        x = x.permute(0, 2, 4, 3, 5, 1).contiguous()
+        x = x.view(b * (hp // ws) * (wp // ws), ws * ws, c)
+        return x, (b, c, h, w, hp, wp)
+
+    def _window_unflatten(self, x, meta):
+        b, c, h, w, hp, wp = meta
+        ws = max(1, self.window_size)
+        x = x.view(b, hp // ws, wp // ws, ws, ws, c)
+        x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
+        x = x.view(b, c, hp, wp)
+        return x[:, :, :h, :w]
+
+    def forward(self, ms_hf, pan_hf, alpha, fused_ll, ms_ll):
+        alpha_pan = alpha * pan_hf
+        diff = (ms_hf - pan_hf).abs()
+        x = torch.cat([ms_hf, pan_hf, alpha_pan, diff, fused_ll, ms_ll], dim=1)
+        x = self.in_proj(x)
+        seq, meta = self._window_flatten(x)
+        seq = self.norm(seq)
+        y = self.mamba(seq)
+        if self.bidirectional:
+            y_rev = torch.flip(self.mamba(torch.flip(seq, dims=[1])), dims=[1])
+            y = 0.5 * (y + y_rev)
+        mixed = self._window_unflatten(y, meta)
+        return self.scale * self.out_proj(mixed)
+
+
 class RSSMWaveletFusionHz(nn.Module):
     def __init__(self, pan_channels_per_level, ms_channels_per_level, hidden_dim=96, latent_dim=32, levels=3,
                  deterministic_only=False, separate_subband_gates=True, use_conv_gru=False,
@@ -507,7 +712,10 @@ class RSSMWaveletFusionHz(nn.Module):
                  residual_learnable_fusion=False, use_state_spatial_mixer=False,
                  use_level_ll_corr=False, z_eval_mode="prior", z_update_order="legacy",
                  z_zero_levels=None, use_z_residual_head=False,
-                 use_local_freq_mixer=False, lfm_kernel_size=3, lfm_hidden_scale=1.0):
+                 use_local_freq_mixer=False, lfm_kernel_size=3, lfm_hidden_scale=1.0,
+                 use_windowed_freq_mixer=False, wfm_window_size=8, wfm_hidden_scale=1.0,
+                 use_mamba_freq_mixer=False, mamba_window_size=8, mamba_hidden_scale=1.0,
+                 mamba_d_state=16, mamba_d_conv=4, mamba_expand=2):
         super().__init__()
         self.levels = levels
         self.hidden_dim = hidden_dim
@@ -527,6 +735,8 @@ class RSSMWaveletFusionHz(nn.Module):
         self.last_z_diagnostics = []
         self.use_z_residual_head = use_z_residual_head
         self.use_local_freq_mixer = use_local_freq_mixer
+        self.use_windowed_freq_mixer = use_windowed_freq_mixer
+        self.use_mamba_freq_mixer = use_mamba_freq_mixer
 
         if use_z_residual_head:
             self.z_res_heads = nn.ModuleList([
@@ -545,6 +755,43 @@ class RSSMWaveletFusionHz(nn.Module):
             ])
             self.local_mixer_hh = nn.ModuleList([
                 LocalFrequencyMixer(ms_channels_per_level[i], lfm_kernel_size, lfm_hidden_scale)
+                for i in range(levels)
+            ])
+
+        if use_windowed_freq_mixer:
+            self.window_mixer_lh = nn.ModuleList([
+                WindowedFrequencyMixer(ms_channels_per_level[i], wfm_window_size, wfm_hidden_scale)
+                for i in range(levels)
+            ])
+            self.window_mixer_hl = nn.ModuleList([
+                WindowedFrequencyMixer(ms_channels_per_level[i], wfm_window_size, wfm_hidden_scale)
+                for i in range(levels)
+            ])
+
+        if use_mamba_freq_mixer:
+            self.mamba_mixer_lh = nn.ModuleList([
+                MambaFrequencyMixer(
+                    ms_channels_per_level[i], mamba_window_size, mamba_hidden_scale,
+                    mamba_d_state, mamba_d_conv, mamba_expand
+                )
+                for i in range(levels)
+            ])
+            self.mamba_mixer_hl = nn.ModuleList([
+                MambaFrequencyMixer(
+                    ms_channels_per_level[i], mamba_window_size, mamba_hidden_scale,
+                    mamba_d_state, mamba_d_conv, mamba_expand
+                )
+                for i in range(levels)
+            ])
+            self.mamba_mixer_hh = nn.ModuleList([
+                MambaFrequencyMixer(
+                    ms_channels_per_level[i], mamba_window_size, mamba_hidden_scale,
+                    mamba_d_state, mamba_d_conv, mamba_expand
+                )
+                for i in range(levels)
+            ])
+            self.window_mixer_hh = nn.ModuleList([
+                WindowedFrequencyMixer(ms_channels_per_level[i], wfm_window_size, wfm_hidden_scale)
                 for i in range(levels)
             ])
 
@@ -786,6 +1033,14 @@ class RSSMWaveletFusionHz(nn.Module):
                 fused_lh = fused_lh + self.local_mixer_lh[level](lh_ms, pan_lh, alpha_lh, fused_ll, ll_ms)
                 fused_hl = fused_hl + self.local_mixer_hl[level](hl_ms, pan_hl, alpha_hl, fused_ll, ll_ms)
                 fused_hh = fused_hh + self.local_mixer_hh[level](hh_ms, pan_hh, alpha_hh, fused_ll, ll_ms)
+            if self.use_windowed_freq_mixer:
+                fused_lh = fused_lh + self.window_mixer_lh[level](lh_ms, pan_lh, alpha_lh, fused_ll, ll_ms)
+                fused_hl = fused_hl + self.window_mixer_hl[level](hl_ms, pan_hl, alpha_hl, fused_ll, ll_ms)
+                fused_hh = fused_hh + self.window_mixer_hh[level](hh_ms, pan_hh, alpha_hh, fused_ll, ll_ms)
+            if self.use_mamba_freq_mixer:
+                fused_lh = fused_lh + self.mamba_mixer_lh[level](lh_ms, pan_lh, alpha_lh, fused_ll, ll_ms)
+                fused_hl = fused_hl + self.mamba_mixer_hl[level](hl_ms, pan_hl, alpha_hl, fused_ll, ll_ms)
+                fused_hh = fused_hh + self.mamba_mixer_hh[level](hh_ms, pan_hh, alpha_hh, fused_ll, ll_ms)
 
             # Z residual auxiliary head: apply zero-init residual correction
             z_res_pred = None
@@ -864,6 +1119,17 @@ class RSSMHWViTHZ(nn.Module):
         use_local_freq_mixer=False,
         lfm_kernel_size=3,
         lfm_hidden_scale=1.0,
+        use_windowed_freq_mixer=False,
+        wfm_window_size=8,
+        wfm_hidden_scale=1.0,
+        use_mamba_freq_mixer=False,
+        mamba_window_size=8,
+        mamba_hidden_scale=1.0,
+        mamba_d_state=16,
+        mamba_d_conv=4,
+        mamba_expand=2,
+        use_channel_dwt_adapter=False,
+        channel_dwt_hidden=32,
     ):
         super().__init__()
         self.deterministic_only = deterministic_only
@@ -872,6 +1138,7 @@ class RSSMHWViTHZ(nn.Module):
         self.use_sdem_lite = use_sdem_lite
         self.z_eval_mode = z_eval_mode
         self.z_update_order = z_update_order
+        self.use_channel_dwt_adapter = use_channel_dwt_adapter
 
         self.pan_raise = raise_channel(in_channel=pan_channel, target_channel=pan_target_channel)
         self.ms_upsample = nn.Sequential(
@@ -879,6 +1146,10 @@ class RSSMHWViTHZ(nn.Module):
             nn.PixelShuffle(4),
         )
         self.ms_act = nn.PReLU(num_parameters=L_up_channel, init=0.01)
+        self.channel_dwt_adapter = (
+            ChannelHaarSpectralAdapter(L_up_channel, hidden_channels=channel_dwt_hidden)
+            if use_channel_dwt_adapter else None
+        )
         self.ms_raise = raise_channel(in_channel=L_up_channel, target_channel=ms_target_channel)
 
         self.wavelet = WaveletPyramid(levels=levels)
@@ -915,6 +1186,15 @@ class RSSMHWViTHZ(nn.Module):
             use_local_freq_mixer=use_local_freq_mixer,
             lfm_kernel_size=lfm_kernel_size,
             lfm_hidden_scale=lfm_hidden_scale,
+            use_windowed_freq_mixer=use_windowed_freq_mixer,
+            wfm_window_size=wfm_window_size,
+            wfm_hidden_scale=wfm_hidden_scale,
+            use_mamba_freq_mixer=use_mamba_freq_mixer,
+            mamba_window_size=mamba_window_size,
+            mamba_hidden_scale=mamba_hidden_scale,
+            mamba_d_state=mamba_d_state,
+            mamba_d_conv=mamba_d_conv,
+            mamba_expand=mamba_expand,
         )
 
         self.reduce = reduce_channel(ms_target_channel=ms_target_channel, L_up_channel=L_up_channel)
@@ -941,6 +1221,8 @@ class RSSMHWViTHZ(nn.Module):
     def forward(self, pan, ms, lms):
         ms_up = self.ms_upsample(ms)
         ms_up = self.ms_act(ms_up + lms)
+        if self.channel_dwt_adapter is not None:
+            ms_up = self.channel_dwt_adapter(ms_up, lms, pan)
 
         if self.image_space_wavelet:
             pan_feat_for_sdem = self.pan_raise(pan) if self.sdem_lite is not None else None

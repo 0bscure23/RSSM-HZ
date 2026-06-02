@@ -413,9 +413,31 @@ def apply_phase_b_freeze(model, freeze_mode):
         lowfreq_modules.append(("lowfreq_corr", model.lowfreq_corr))
     if getattr(model, "band_corr", None) is not None:
         lowfreq_modules.append(("band_corr", model.band_corr))
+    if getattr(model, "channel_dwt_adapter", None) is not None:
+        lowfreq_modules.append(("channel_dwt_adapter", model.channel_dwt_adapter))
     for idx, block in enumerate(getattr(fusion, "fusion_blocks", [])):
         if getattr(block, "level_ll_corr", None) is not None:
             lowfreq_modules.append((f"rssm_fusion.fusion_blocks.{idx}.level_ll_corr", block.level_ll_corr))
+
+    freq_modules = []
+    if getattr(fusion, "use_local_freq_mixer", False):
+        freq_modules.extend([
+            ("rssm_fusion.local_mixer_lh", fusion.local_mixer_lh),
+            ("rssm_fusion.local_mixer_hl", fusion.local_mixer_hl),
+            ("rssm_fusion.local_mixer_hh", fusion.local_mixer_hh),
+        ])
+    if getattr(fusion, "use_windowed_freq_mixer", False):
+        freq_modules.extend([
+            ("rssm_fusion.window_mixer_lh", fusion.window_mixer_lh),
+            ("rssm_fusion.window_mixer_hl", fusion.window_mixer_hl),
+            ("rssm_fusion.window_mixer_hh", fusion.window_mixer_hh),
+        ])
+    if getattr(fusion, "use_mamba_freq_mixer", False):
+        freq_modules.extend([
+            ("rssm_fusion.mamba_mixer_lh", fusion.mamba_mixer_lh),
+            ("rssm_fusion.mamba_mixer_hl", fusion.mamba_mixer_hl),
+            ("rssm_fusion.mamba_mixer_hh", fusion.mamba_mixer_hh),
+        ])
 
     if freeze_mode == "state_high":
         for param in model.parameters():
@@ -429,6 +451,7 @@ def apply_phase_b_freeze(model, freeze_mode):
             *gate_modules,
             *fusion_modules,
             ("rssm_fusion.z_to_gate", model.rssm_fusion.z_to_gate),
+            *freq_modules,
             *img_wav_modules,
             ("reduce", model.reduce),
             *lowfreq_modules,
@@ -450,6 +473,7 @@ def apply_phase_b_freeze(model, freeze_mode):
             *gate_modules,
             *fusion_modules,
             ("rssm_fusion.z_to_gate", model.rssm_fusion.z_to_gate),
+            *freq_modules,
             ("reduce", model.reduce),
             *lowfreq_modules,
             ("out_act", model.out_act),
@@ -504,6 +528,7 @@ def apply_phase_b_freeze(model, freeze_mode):
             ("rssm_fusion.pan_high_to_ms", model.rssm_fusion.pan_high_to_ms),
             *gate_modules,
             ("rssm_fusion.z_to_gate", model.rssm_fusion.z_to_gate),
+            *freq_modules,
             ("reduce", model.reduce),
             *lowfreq_modules,
             ("out_act", model.out_act),
@@ -871,6 +896,28 @@ def main():
                         help="Depthwise kernel size for local frequency mixer")
     parser.add_argument("--lfm-hidden-scale", type=float, default=1.0,
                         help="Hidden channel scale for local frequency mixer")
+    parser.add_argument("--use-windowed-frequency-mixer", action="store_true",
+                        help="Enable dependency-free windowed selective-scan mixers for LH/HL/HH")
+    parser.add_argument("--wfm-window-size", type=int, default=8,
+                        help="Local window size for windowed frequency selective scan")
+    parser.add_argument("--wfm-hidden-scale", type=float, default=1.0,
+                        help="Hidden channel scale for windowed frequency mixer")
+    parser.add_argument("--use-mamba-frequency-mixer", action="store_true",
+                        help="Enable true mamba_ssm window mixers for LH/HL/HH")
+    parser.add_argument("--mamba-window-size", type=int, default=8,
+                        help="Local window size for true Mamba frequency mixer")
+    parser.add_argument("--mamba-hidden-scale", type=float, default=1.0,
+                        help="Hidden channel scale for true Mamba frequency mixer")
+    parser.add_argument("--mamba-d-state", type=int, default=16,
+                        help="Mamba state dimension for frequency mixer")
+    parser.add_argument("--mamba-d-conv", type=int, default=4,
+                        help="Mamba local convolution width for frequency mixer")
+    parser.add_argument("--mamba-expand", type=int, default=2,
+                        help="Mamba expansion ratio for frequency mixer")
+    parser.add_argument("--use-channel-dwt-adapter", action="store_true",
+                        help="Enable 1D channel-wise Haar spectral adapter for MS_up")
+    parser.add_argument("--channel-dwt-hidden", type=int, default=32,
+                        help="Hidden channels for channel-wise Haar spectral adapter")
     parser.add_argument("--w-mse", type=float, default=0.0,
                         help="Optional MSE loss weight for PSNR-oriented finetuning")
     parser.add_argument("--w-band-balanced", type=float, default=0.0,
@@ -937,6 +984,17 @@ def main():
         use_local_freq_mixer=args.use_local_frequency_mixer,
         lfm_kernel_size=args.lfm_kernel_size,
         lfm_hidden_scale=args.lfm_hidden_scale,
+        use_windowed_freq_mixer=args.use_windowed_frequency_mixer,
+        wfm_window_size=args.wfm_window_size,
+        wfm_hidden_scale=args.wfm_hidden_scale,
+        use_mamba_freq_mixer=args.use_mamba_frequency_mixer,
+        mamba_window_size=args.mamba_window_size,
+        mamba_hidden_scale=args.mamba_hidden_scale,
+        mamba_d_state=args.mamba_d_state,
+        mamba_d_conv=args.mamba_d_conv,
+        mamba_expand=args.mamba_expand,
+        use_channel_dwt_adapter=args.use_channel_dwt_adapter,
+        channel_dwt_hidden=args.channel_dwt_hidden,
     ).to(device)
 
     # If training fresh, zero-init ms_upsample + fused_weight for LMS-start.
@@ -1116,7 +1174,8 @@ def main():
         f"run_tag={run_tag} device={device} epochs={epochs} batch_size={batch_size} "
         f"state_mode={args.state_mode} phase={args.phase} distill_weight={args.distill_weight} "
         f"z_eval_mode={args.z_eval_mode} z_update_order={args.z_update_order} z_zero_levels={args.z_zero_levels} "
-        f"use_lfm={args.use_local_frequency_mixer} w_mse={args.w_mse} w_band={args.w_band_balanced}"
+        f"use_lfm={args.use_local_frequency_mixer} use_wfm={args.use_windowed_frequency_mixer} "
+        f"use_chdwt={args.use_channel_dwt_adapter} w_mse={args.w_mse} w_band={args.w_band_balanced}"
     )
 
     for epoch in range(start_epoch, epochs):
