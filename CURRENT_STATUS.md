@@ -1,9 +1,11 @@
 # RSSM-HZ Current Status
 
-Updated: 2026-06-01.
+Updated: 2026-06-05.
 
 For the latest GF2/QB innovation-z metrics and online-friendly JSON summaries,
 see [docs/experiment_results_20260601.md](docs/experiment_results_20260601.md).
+For the Mamba/WFM/Channel-DWT continuation summary, see
+[docs/mamba_frequency_mixer_20260602.md](docs/mamba_frequency_mixer_20260602.md).
 
 This note summarizes the current state of the RSSM-HZ experiments so the project can be handed to another model or collaborator for review.
 
@@ -117,7 +119,20 @@ RSSM-HZ is already competitive on PanScale-style data, especially when the model
 
 ### Original WFANet datasets
 
-These results are still weaker than WFANet.
+These results are still weaker than the local WFANet reproduction.
+
+Important source note:
+
+The WFANet numbers below are from local reproduction / local evaluation files,
+not copied directly from the WFANet paper table. In particular:
+
+- WV3 comes from `plp/WFANet/eval_wv3_package/wv3_metrics_summary.json`.
+- GF2 comes from `plp/WFANet/results_rssm_hz/gf2_wfanet_v2/test_metrics.json`.
+- QB comes from `plp/WFANet/results_rssm_hz/qb_wfanet_v2/test_metrics.json`.
+
+Paper-reported numbers can differ because of MATLAB evaluation details, Q4/Q8
+implementation, crop/border handling, and dynamic-range conventions. Use the
+local WFANet reproduction for apples-to-apples comparisons with RSSM-HZ runs.
 
 | Dataset | Method | PSNR | SAM | ERGAS | Q/Q8 |
 |---|---:|---:|---:|---:|---:|
@@ -127,15 +142,33 @@ These results are still weaker than WFANet.
 | GF2 | WFANet repro | 50.0684 | 0.6641 | 0.5899 | 0.9088 |
 | GF2 | RSSM-HZ older baseline | 48.4208 | 0.7752 | 0.7183 | 0.8882 |
 | GF2 | RSSM-HZ innovation-z | 48.9536 | 0.7363 | 0.6753 | 0.8956 |
+| GF2 | RSSM-HZ Mamba/WFM/ChDWT best | 49.0793 | 0.7277 | 0.6651 | 0.8974 |
+| GF2 | RSSM-HZ doc-FMamba l1 160ep | 49.0383 | 0.7303 | 0.6682 | 0.8968 |
+| GF2 | RSSM-HZ doc-FMamba mseband 160ep | 49.0395 | 0.7304 | 0.6682 | 0.8969 |
 | QB | WFANet repro | 38.6932 | 4.3781 | 3.5485 | 0.8463 |
 | QB | RSSM-HZ older baseline | 37.6153 | 4.7196 | 4.0308 | 0.8273 |
 | QB | RSSM-HZ innovation-z | 37.9858 | 4.6096 | 3.8598 | 0.8322 |
+| QB | RSSM-HZ Mamba/WFM/ChDWT best | 38.0518 | 4.5846 | 3.8293 | 0.8340 |
+| QB | RSSM-HZ doc-FMamba mseband 160ep | 38.0161 | 4.5950 | 3.8451 | 0.8330 |
+| QB | RSSM-HZ doc-FMamba samll 160ep | 38.0373 | 4.5914 | 3.8375 | 0.8330 |
 
 Important metric note:
 
 For GF2/QB, use `q_win_size=4` for fair Q4 comparison. Some older scripts
 printed the metric under `Q8` even when the window size was 4, so always check
 the stored `q_win_size` field in each metrics JSON.
+
+Interpretation as of 2026-06-05:
+
+- The best no-distillation GF2/QB line is still the incremental
+  Mamba/WFM/Channel-DWT version, not the full doc-FMamba rewrite.
+- The full doc-FMamba / WSLM-style blueprint was trained for 160 epochs on
+  GF2/QB and did not improve over the Mamba/WFM/Channel-DWT version.
+- Extending doc-FMamba training from 80 to 160 epochs did not fix the gap:
+  GF2 l1 changed from about 49.041 PSNR at 80 epochs to 49.038 PSNR at
+  160 epochs on the final test set.
+- Therefore, the current evidence suggests that the WFANet gap on GF2/QB is
+  structural / protocol-related rather than simply caused by under-training.
 
 ## 5. Current Open Problems
 
@@ -175,33 +208,67 @@ Landsat diagnostic experiments compared 2-level and 3-level DWT under 64x64 crop
 
 This suggests that simply changing 3-level DWT to 2-level DWT is not enough.
 
-## 6. Experiments Currently Running
+## 6. Recently Completed Experiments
 
-The current low-cost experiment is PanScale checkpoint transfer to GF2/QB.
+### Mamba/WFM/Channel-DWT continuation
 
-| Run tag | Target | Init checkpoint |
-|---|---|---|
-| `transfer_gf2_from_jilin_20260526` | GF2 | jilin PanScale best |
-| `transfer_gf2_from_skysat_20260526` | GF2 | skysat PanScale best |
-| `transfer_qb_from_jilin_20260526` | QB | jilin PanScale best |
-| `transfer_qb_from_skysat_20260526` | QB | skysat PanScale best |
+This was the most useful incremental branch after innovation-z.
 
-Purpose:
+| Dataset | Run tag | PSNR | SAM | ERGAS | Q4 |
+|---|---|---:|---:|---:|---:|
+| GF2 | `gf2_mamba_wfm_chdwt_l1_80ep_from120` | 49.0793 | 0.7277 | 0.6651 | 0.8974 |
+| GF2 | `gf2_mamba_wfm_chdwt_mseband_80ep_from120` | 49.0762 | 0.7283 | 0.6654 | 0.8973 |
+| QB | `qb_mamba_wfm_chdwt_mseband_80ep_from120` | 38.0314 | 4.5916 | 3.8375 | 0.8341 |
+| QB | `qb_mamba_wfm_chdwt_samll_80ep_from120` | 38.0518 | 4.5846 | 3.8293 | 0.8340 |
 
-Check whether PanScale pretraining gives RSSM-HZ a useful cross-scale prior for the original 4-channel datasets.
+Conclusion:
+
+This branch gives a consistent small improvement over innovation-z, but the
+remaining gap to WFANet is still large on GF2 and visible on QB.
+
+### Doc-FMamba / WSLM-style blueprint
+
+The doc-faithful rewrite was implemented and then tested with 160-epoch
+Phase-B fine-tuning.
+
+| Dataset | Run tag | PSNR | SAM | ERGAS | Q4 |
+|---|---|---:|---:|---:|---:|
+| GF2 | `gf2_doc_fmamba_l1_80ep_gpu3r1` | 49.0383 | 0.7303 | 0.6682 | 0.8968 |
+| GF2 | `gf2_doc_fmamba_mseband_160ep_gpu0` | 49.0395 | 0.7304 | 0.6682 | 0.8969 |
+| QB | `qb_doc_fmamba_mseband_160ep_gpu1` | 38.0161 | 4.5950 | 3.8451 | 0.8330 |
+| QB | `qb_doc_fmamba_samll_160ep_gpu2` | 38.0373 | 4.5914 | 3.8375 | 0.8330 |
+
+Conclusion:
+
+The full doc-FMamba branch is not the current best direction. It is slightly
+worse than the simpler Mamba/WFM/Channel-DWT branch, despite the longer
+160-epoch fine-tuning. Keep it as a negative / diagnostic experiment rather
+than the main paper path.
 
 ## 7. Suggested Next Directions
 
 Recommended next experiments:
 
-1. Add a lightweight low-frequency / spectral correction head after IDWT or at each LL level.
-2. Try PanScale pretraining transfer for GF2/QB and compare with from-scratch GF2/QB checkpoints.
-3. If original large scenes for WV3/GF2/QB can be obtained, train or fine-tune on larger crops instead of only 64x64 patches.
-4. Keep no-distillation as the main paper setting.
-5. Use a single fixed training recipe when possible to avoid dataset-specific tuning concerns.
+1. Return to the Mamba/WFM/Channel-DWT version as the current strongest
+   GF2/QB baseline, rather than continuing the doc-FMamba branch.
+2. Add targeted low-frequency / spectral correction only if it is residual-safe
+   and evaluated with a fixed recipe across GF2/QB.
+3. Analyze band-wise residuals and low-frequency bias on GF2/QB; previous error
+   analysis suggested that remaining errors are concentrated in hard
+   multispectral bands.
+4. Try PanScale pretraining transfer for GF2/QB and compare with from-scratch
+   GF2/QB checkpoints.
+5. If original large scenes for WV3/GF2/QB can be obtained, train or fine-tune
+   on larger crops instead of only 64x64 patches.
+6. Keep no-distillation as the main paper setting.
+7. Use a single fixed training recipe when possible to avoid dataset-specific
+   tuning concerns.
 
 Not recommended as the main paper route:
 
 1. Pseudo-stitching unrelated 64x64 patches into fake large images.
 2. Image interpolation from 64x64 to larger sizes as a substitute for real large-image training.
 3. Relying on WFANet teacher distillation for headline results.
+4. Continuing to scale the doc-FMamba / WSLM-style branch without a more
+   specific diagnosis, because 160-epoch runs did not improve over the simpler
+   Mamba/WFM/Channel-DWT branch.
