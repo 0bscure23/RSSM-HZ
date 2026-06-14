@@ -49,6 +49,51 @@ class PanDataset(Dataset):
         return gt, pan, ms, lms
 
 
+class RandomCropPanDataset(PanDataset):
+    def __init__(self, path, ratio=2047.0, max_samples=None, crop_size=0, crop_align=1, repeat=4):
+        super().__init__(path, ratio=ratio, max_samples=max_samples)
+        self.crop_size = int(crop_size)
+        self.crop_align = max(1, int(crop_align))
+        self.repeat = max(1, int(repeat))
+        if self.crop_size <= 0:
+            raise ValueError("crop_size must be positive for RandomCropPanDataset")
+        if self.gt.shape[-1] != self.pan.shape[-1] or self.gt.shape[-2] != self.pan.shape[-2]:
+            raise ValueError("gt and pan spatial sizes must match for random cropping")
+        self.scale = int(round(self.gt.shape[-1] / self.ms.shape[-1]))
+        if self.scale <= 0 or self.gt.shape[-1] % self.ms.shape[-1] != 0:
+            raise ValueError("gt/ms spatial ratio must be an integer")
+        if self.crop_size % self.scale != 0:
+            raise ValueError(f"crop_size must be divisible by scale={self.scale}")
+
+    def __len__(self):
+        return self.gt.shape[0] * self.repeat
+
+    def __getitem__(self, idx):
+        base_idx = idx % self.gt.shape[0]
+        _, h, w = self.gt[base_idx].shape
+        if self.crop_size > h or self.crop_size > w:
+            raise ValueError(f"crop_size={self.crop_size} exceeds sample size {(h, w)}")
+
+        max_y = h - self.crop_size
+        max_x = w - self.crop_size
+        y = np.random.randint(0, max_y // self.crop_align + 1) * self.crop_align
+        x = np.random.randint(0, max_x // self.crop_align + 1) * self.crop_align
+        ms_y = y // self.scale
+        ms_x = x // self.scale
+        ms_size = self.crop_size // self.scale
+
+        gt = self.gt[base_idx, :, y:y + self.crop_size, x:x + self.crop_size]
+        pan = self.pan[base_idx, :, y:y + self.crop_size, x:x + self.crop_size]
+        ms = self.ms[base_idx, :, ms_y:ms_y + ms_size, ms_x:ms_x + ms_size]
+        lms = self.lms[base_idx, :, y:y + self.crop_size, x:x + self.crop_size]
+        return (
+            torch.from_numpy(gt / self.ratio).float(),
+            torch.from_numpy(pan / self.ratio).float(),
+            torch.from_numpy(ms / self.ratio).float(),
+            torch.from_numpy(lms / self.ratio).float(),
+        )
+
+
 def ssim_loss(pred, gt, win_size=11, data_range=1.0):
     """Differentiable SSIM loss (1 - SSIM)."""
     from torch.nn.functional import conv2d
@@ -109,6 +154,18 @@ def band_balanced_l1_loss(pred, gt):
     diff = (pred - gt).abs().mean(dim=(0, 2, 3))
     scale = gt.detach().std(dim=(0, 2, 3), unbiased=False).clamp_min(1e-3)
     return (diff / scale).mean()
+
+
+def ms_fidelity_loss(pred, ms):
+    """Reduced-resolution consistency: HRMS prediction should downsample to LRMS."""
+    pred_lr = F.adaptive_avg_pool2d(pred, ms.shape[-2:])
+    return F.l1_loss(pred_lr, ms)
+
+
+def pan_fidelity_loss(pred, pan):
+    """Simple PAN consistency using the mean multispectral intensity proxy."""
+    pred_pan = pred.mean(dim=1, keepdim=True)
+    return F.l1_loss(pred_pan, pan)
 
 
 def psnr_tensor(pred, gt, data_range=1.0):
@@ -350,11 +407,21 @@ def apply_phase_b_freeze(model, freeze_mode):
     if freeze_mode == "fusion_only":
         for param in model.parameters():
             param.requires_grad = False
-        trainable_modules = [
-            ("rssm_fusion.conv_fusion_lh", model.rssm_fusion.conv_fusion_lh),
-            ("rssm_fusion.conv_fusion_hl", model.rssm_fusion.conv_fusion_hl),
-            ("rssm_fusion.conv_fusion_hh", model.rssm_fusion.conv_fusion_hh),
-        ]
+        if getattr(model, "use_wfanet_two_stage", False):
+            trainable_modules = [
+                ("rssm_fusion.coarse_stage", model.rssm_fusion.coarse_stage),
+                ("rssm_fusion.fine_stage", model.rssm_fusion.fine_stage),
+                ("rssm_fusion.state_up_h", model.rssm_fusion.state_up_h),
+                ("rssm_fusion.state_up_z", model.rssm_fusion.state_up_z),
+                ("rssm_fusion.final_combine", model.rssm_fusion.final_combine),
+                ("rssm_fusion.final_refine", model.rssm_fusion.final_refine),
+            ]
+        else:
+            trainable_modules = [
+                ("rssm_fusion.conv_fusion_lh", model.rssm_fusion.conv_fusion_lh),
+                ("rssm_fusion.conv_fusion_hl", model.rssm_fusion.conv_fusion_hl),
+                ("rssm_fusion.conv_fusion_hh", model.rssm_fusion.conv_fusion_hh),
+            ]
         for _, module in trainable_modules:
             for param in module.parameters():
                 param.requires_grad = True
@@ -371,6 +438,84 @@ def apply_phase_b_freeze(model, freeze_mode):
             for param in module.parameters():
                 param.requires_grad = False
         return [name for name, _ in frozen_modules]
+
+    if getattr(model, "use_wfanet_two_stage", False):
+        fusion = model.rssm_fusion
+        lowfreq_modules = []
+        if getattr(model, "lowfreq_corr", None) is not None:
+            lowfreq_modules.append(("lowfreq_corr", model.lowfreq_corr))
+        if getattr(model, "band_corr", None) is not None:
+            lowfreq_modules.append(("band_corr", model.band_corr))
+        if getattr(model, "channel_dwt_adapter", None) is not None:
+            lowfreq_modules.append(("channel_dwt_adapter", model.channel_dwt_adapter))
+
+        stage_gate_modules = []
+        for stage_name, stage in (("coarse_stage", fusion.coarse_stage), ("fine_stage", fusion.fine_stage)):
+            stage_gate_modules.append((f"rssm_fusion.{stage_name}.pan_high_to_ms", stage.pan_high_to_ms))
+            stage_gate_modules.append((f"rssm_fusion.{stage_name}.z_to_gate", stage.z_to_gate))
+            if getattr(stage, "separate_subband_gates", False):
+                stage_gate_modules.extend([
+                    (f"rssm_fusion.{stage_name}.high_gate_lh", stage.high_gate_lh),
+                    (f"rssm_fusion.{stage_name}.high_gate_hl", stage.high_gate_hl),
+                    (f"rssm_fusion.{stage_name}.high_gate_hh", stage.high_gate_hh),
+                ])
+            else:
+                stage_gate_modules.append((f"rssm_fusion.{stage_name}.high_gate", stage.high_gate))
+
+        def _freeze_all_then_enable(trainable_modules):
+            for param in model.parameters():
+                param.requires_grad = False
+            for _, module in trainable_modules:
+                for param in module.parameters():
+                    param.requires_grad = True
+            if hasattr(model, "fused_weight") and freeze_mode in {"head_only", "head_reduce", "gate_head_reduce"}:
+                model.fused_weight.requires_grad = True
+            names = [name for name, _ in trainable_modules]
+            if hasattr(model, "fused_weight") and freeze_mode in {"head_only", "head_reduce", "gate_head_reduce"}:
+                names.append("fused_weight")
+            return names
+
+        if freeze_mode == "head_only":
+            return _freeze_all_then_enable([
+                *lowfreq_modules,
+                ("out_act", model.out_act),
+            ])
+        if freeze_mode == "head_reduce":
+            return _freeze_all_then_enable([
+                ("reduce", model.reduce),
+                *lowfreq_modules,
+                ("out_act", model.out_act),
+            ])
+        if freeze_mode == "gate_head_reduce":
+            return _freeze_all_then_enable([
+                *stage_gate_modules,
+                ("reduce", model.reduce),
+                *lowfreq_modules,
+                ("out_act", model.out_act),
+            ])
+        if freeze_mode == "state_gate_head":
+            return _freeze_all_then_enable([
+                ("rssm_fusion.coarse_stage.state_fusion", fusion.coarse_stage.state_fusion),
+                ("rssm_fusion.fine_stage.state_fusion", fusion.fine_stage.state_fusion),
+                ("rssm_fusion.state_up_h", fusion.state_up_h),
+                ("rssm_fusion.state_up_z", fusion.state_up_z),
+                *stage_gate_modules,
+                ("reduce", model.reduce),
+                *lowfreq_modules,
+                ("out_act", model.out_act),
+            ])
+        if freeze_mode == "state_high":
+            return _freeze_all_then_enable([
+                ("rssm_fusion.coarse_stage", fusion.coarse_stage),
+                ("rssm_fusion.fine_stage", fusion.fine_stage),
+                ("rssm_fusion.state_up_h", fusion.state_up_h),
+                ("rssm_fusion.state_up_z", fusion.state_up_z),
+                ("rssm_fusion.final_combine", fusion.final_combine),
+                ("rssm_fusion.final_refine", fusion.final_refine),
+                ("reduce", model.reduce),
+                *lowfreq_modules,
+                ("out_act", model.out_act),
+            ])
 
     # Auto-detect gate module names based on model configuration.
     fusion = model.rssm_fusion
@@ -413,9 +558,31 @@ def apply_phase_b_freeze(model, freeze_mode):
         lowfreq_modules.append(("lowfreq_corr", model.lowfreq_corr))
     if getattr(model, "band_corr", None) is not None:
         lowfreq_modules.append(("band_corr", model.band_corr))
+    if getattr(model, "channel_dwt_adapter", None) is not None:
+        lowfreq_modules.append(("channel_dwt_adapter", model.channel_dwt_adapter))
     for idx, block in enumerate(getattr(fusion, "fusion_blocks", [])):
         if getattr(block, "level_ll_corr", None) is not None:
             lowfreq_modules.append((f"rssm_fusion.fusion_blocks.{idx}.level_ll_corr", block.level_ll_corr))
+
+    freq_modules = []
+    if getattr(fusion, "use_local_freq_mixer", False):
+        freq_modules.extend([
+            ("rssm_fusion.local_mixer_lh", fusion.local_mixer_lh),
+            ("rssm_fusion.local_mixer_hl", fusion.local_mixer_hl),
+            ("rssm_fusion.local_mixer_hh", fusion.local_mixer_hh),
+        ])
+    if getattr(fusion, "use_windowed_freq_mixer", False):
+        freq_modules.extend([
+            ("rssm_fusion.window_mixer_lh", fusion.window_mixer_lh),
+            ("rssm_fusion.window_mixer_hl", fusion.window_mixer_hl),
+            ("rssm_fusion.window_mixer_hh", fusion.window_mixer_hh),
+        ])
+    if getattr(fusion, "use_mamba_freq_mixer", False):
+        freq_modules.extend([
+            ("rssm_fusion.mamba_mixer_lh", fusion.mamba_mixer_lh),
+            ("rssm_fusion.mamba_mixer_hl", fusion.mamba_mixer_hl),
+            ("rssm_fusion.mamba_mixer_hh", fusion.mamba_mixer_hh),
+        ])
 
     if freeze_mode == "state_high":
         for param in model.parameters():
@@ -429,6 +596,7 @@ def apply_phase_b_freeze(model, freeze_mode):
             *gate_modules,
             *fusion_modules,
             ("rssm_fusion.z_to_gate", model.rssm_fusion.z_to_gate),
+            *freq_modules,
             *img_wav_modules,
             ("reduce", model.reduce),
             *lowfreq_modules,
@@ -450,6 +618,7 @@ def apply_phase_b_freeze(model, freeze_mode):
             *gate_modules,
             *fusion_modules,
             ("rssm_fusion.z_to_gate", model.rssm_fusion.z_to_gate),
+            *freq_modules,
             ("reduce", model.reduce),
             *lowfreq_modules,
             ("out_act", model.out_act),
@@ -504,6 +673,7 @@ def apply_phase_b_freeze(model, freeze_mode):
             ("rssm_fusion.pan_high_to_ms", model.rssm_fusion.pan_high_to_ms),
             *gate_modules,
             ("rssm_fusion.z_to_gate", model.rssm_fusion.z_to_gate),
+            *freq_modules,
             ("reduce", model.reduce),
             *lowfreq_modules,
             ("out_act", model.out_act),
@@ -775,6 +945,37 @@ def main():
                         help="Use a single shared high-frequency gate (overrides --separate-subband-gates)")
     parser.add_argument("--use-conv-gru", action="store_true", default=False,
                         help="Use 2D ConvGRU instead of per-pixel GRUCell for state updates")
+    parser.add_argument(
+        "--state-conv-type",
+        choices=[
+            "plain",
+            "dw_large",
+            "convnext_dw",
+            "ms_dilated",
+            "deformable",
+            "window_attn",
+            "dw_window_attn",
+            "swin_window_attn",
+        ],
+        default="plain",
+        help="Convolution operator inside ConvGRU gates/candidate",
+    )
+    parser.add_argument(
+        "--state-kernel-size",
+        type=int,
+        default=3,
+        help="Kernel size for plain/dw_large/convnext_dw ConvGRU operators",
+    )
+    parser.add_argument(
+        "--freq-state-mode",
+        choices=["mixed", "simple", "split"],
+        default="mixed",
+        help=(
+            "mixed: old PAN_LL/LH/HL/HH concat state; "
+            "simple: LL updates state and HF modulates ConvGRU gates; "
+            "split: independent LL/LH/HL/HH recurrent fusion blocks"
+        ),
+    )
     parser.add_argument("--learnable-fusion", action="store_true", default=False,
                         help="Replace additive PAN injection with learnable ConvFusion blocks")
     parser.add_argument("--residual-learnable-fusion", action="store_true", default=False,
@@ -789,6 +990,12 @@ def main():
                         help="Enable zero-init low-frequency/spectral correction head before residual output")
     parser.add_argument("--use-sdem-lite", action="store_true", default=False,
                         help="Enable zero-init lightweight PAN spatial detail enhancement before output reduction")
+    parser.add_argument("--use-wfanet-two-stage", action="store_true", default=False,
+                        help="Use WFANet-style coarse/fine two-stage RSSM fusion instead of recursive multi-level fusion")
+    parser.add_argument("--share-scale-recurrent", action="store_true", default=False,
+                        help="Share the coarse-to-fine recurrent state fusion block across scales/stages")
+    parser.add_argument("--phase1-preset", action="store_true", default=False,
+                        help="Enable the Phase-1 RSSM-HZ preset: two-stage + simple state + shared dw-window recurrent cell + local HF mixer")
     parser.add_argument("--use-state-spatial-mixer", action="store_true", default=False,
                         help="Enable zero-init local spatial mixer on recurrent hidden states")
     parser.add_argument("--use-level-ll-corr", action="store_true", default=False,
@@ -832,6 +1039,9 @@ def main():
     parser.add_argument("--train-path", default=None, help="Training H5 path")
     parser.add_argument("--test-path", default=None, help="Test H5 path")
     parser.add_argument("--val-path", default=None, help="Validation H5 path; defaults to Dataset/WV3/valid_wv3.h5 if present")
+    parser.add_argument("--train-crop-size", type=int, default=0, help="Random high-resolution crop size for training; 0 uses full samples")
+    parser.add_argument("--train-crop-align", type=int, default=4, help="Align crop origin to this high-resolution stride")
+    parser.add_argument("--train-crop-repeat", type=int, default=4, help="Virtual repeats per image when random crop training is enabled")
     parser.add_argument("--val-every", type=int, default=0, help="Run validation every N epochs; 0 disables validation")
     parser.add_argument("--max-val-samples", type=int, default=None, help="Optional cap on validation samples")
     parser.add_argument("--val-batch-size", type=int, default=32, help="Validation batch size")
@@ -871,14 +1081,54 @@ def main():
                         help="Depthwise kernel size for local frequency mixer")
     parser.add_argument("--lfm-hidden-scale", type=float, default=1.0,
                         help="Hidden channel scale for local frequency mixer")
+    parser.add_argument("--use-linear-frequency-attention", action="store_true",
+                        help="Enable O(N*C^2) WFANet-style linear frequency attention in two-stage fusion")
+    parser.add_argument("--linear-attn-heads", type=int, default=4,
+                        help="Number of heads for linear frequency attention")
+    parser.add_argument("--use-windowed-frequency-mixer", action="store_true",
+                        help="Enable dependency-free windowed selective-scan mixers for LH/HL/HH")
+    parser.add_argument("--wfm-window-size", type=int, default=8,
+                        help="Local window size for windowed frequency selective scan")
+    parser.add_argument("--wfm-hidden-scale", type=float, default=1.0,
+                        help="Hidden channel scale for windowed frequency mixer")
+    parser.add_argument("--use-mamba-frequency-mixer", action="store_true",
+                        help="Enable true mamba_ssm window mixers for LH/HL/HH")
+    parser.add_argument("--mamba-window-size", type=int, default=8,
+                        help="Local window size for true Mamba frequency mixer")
+    parser.add_argument("--mamba-hidden-scale", type=float, default=1.0,
+                        help="Hidden channel scale for true Mamba frequency mixer")
+    parser.add_argument("--mamba-d-state", type=int, default=16,
+                        help="Mamba state dimension for frequency mixer")
+    parser.add_argument("--mamba-d-conv", type=int, default=4,
+                        help="Mamba local convolution width for frequency mixer")
+    parser.add_argument("--mamba-expand", type=int, default=2,
+                        help="Mamba expansion ratio for frequency mixer")
+    parser.add_argument("--use-channel-dwt-adapter", action="store_true",
+                        help="Enable 1D channel-wise Haar spectral adapter for MS_up")
+    parser.add_argument("--channel-dwt-hidden", type=int, default=32,
+                        help="Hidden channels for channel-wise Haar spectral adapter")
     parser.add_argument("--w-mse", type=float, default=0.0,
                         help="Optional MSE loss weight for PSNR-oriented finetuning")
     parser.add_argument("--w-band-balanced", type=float, default=0.0,
                         help="Optional per-band normalized L1 loss weight")
+    parser.add_argument("--w-ms-fidelity", type=float, default=0.0,
+                        help="Optional LRMS consistency loss weight: downsample(pred) should match input MS")
+    parser.add_argument("--w-pan-fidelity", type=float, default=0.0,
+                        help="Optional PAN consistency loss weight using mean(pred bands) as a lightweight intensity proxy")
     args = parser.parse_args()
 
     if args.residual_learnable_fusion:
         args.learnable_fusion = True
+
+    if args.phase1_preset:
+        args.use_wfanet_two_stage = True
+        args.use_conv_gru = True
+        args.freq_state_mode = "simple"
+        args.state_conv_type = "dw_window_attn"
+        args.state_kernel_size = 7
+        args.share_scale_recurrent = True
+        args.use_local_frequency_mixer = True
+        args.use_level_ll_corr = True
 
     if args.phase == "a":
         args.state_mode = "h"
@@ -918,6 +1168,9 @@ def main():
         deterministic_only=(args.state_mode == "h"),
         separate_subband_gates=separate_subband,
         use_conv_gru=args.use_conv_gru,
+        state_conv_type=args.state_conv_type,
+        state_kernel_size=args.state_kernel_size,
+        freq_state_mode=args.freq_state_mode,
         learnable_fusion=args.learnable_fusion,
         signed_hf_gate=args.signed_hf_gate,
         hf_gate_scale=args.hf_gate_scale,
@@ -937,6 +1190,21 @@ def main():
         use_local_freq_mixer=args.use_local_frequency_mixer,
         lfm_kernel_size=args.lfm_kernel_size,
         lfm_hidden_scale=args.lfm_hidden_scale,
+        use_linear_freq_attention=args.use_linear_frequency_attention,
+        linear_attn_heads=args.linear_attn_heads,
+        use_windowed_freq_mixer=args.use_windowed_frequency_mixer,
+        wfm_window_size=args.wfm_window_size,
+        wfm_hidden_scale=args.wfm_hidden_scale,
+        use_mamba_freq_mixer=args.use_mamba_frequency_mixer,
+        mamba_window_size=args.mamba_window_size,
+        mamba_hidden_scale=args.mamba_hidden_scale,
+        mamba_d_state=args.mamba_d_state,
+        mamba_d_conv=args.mamba_d_conv,
+        mamba_expand=args.mamba_expand,
+        use_channel_dwt_adapter=args.use_channel_dwt_adapter,
+        channel_dwt_hidden=args.channel_dwt_hidden,
+        use_wfanet_two_stage=args.use_wfanet_two_stage,
+        share_scale_recurrent=args.share_scale_recurrent,
     ).to(device)
 
     # If training fresh, zero-init ms_upsample + fused_weight for LMS-start.
@@ -1064,7 +1332,21 @@ def main():
     if not os.path.exists(train_path):
         raise FileNotFoundError(f"Missing train set: {args.train_path or 'train_wv3-001.h5/train_wv3.h5'}")
 
-    train_ds = PanDataset(train_path, ratio=float(config["ratio"]), max_samples=args.max_train_samples)
+    if args.train_crop_size > 0:
+        train_ds = RandomCropPanDataset(
+            train_path,
+            ratio=float(config["ratio"]),
+            max_samples=args.max_train_samples,
+            crop_size=args.train_crop_size,
+            crop_align=args.train_crop_align,
+            repeat=args.train_crop_repeat,
+        )
+        print(
+            f"random crop training enabled: crop_size={args.train_crop_size} "
+            f"align={args.train_crop_align} repeat={args.train_crop_repeat}"
+        )
+    else:
+        train_ds = PanDataset(train_path, ratio=float(config["ratio"]), max_samples=args.max_train_samples)
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
@@ -1088,7 +1370,7 @@ def main():
 
     history = {
         "total": [], "l1": [], "mse": [], "band": [], "sam": [], "edge": [],
-        "wave": [], "ll": [], "ssim": [], "distill": [], "kl": [],
+        "wave": [], "ll": [], "ssim": [], "ms_fid": [], "pan_fid": [], "distill": [], "kl": [],
         "z_res_ll": [], "z_res_hf": []
     }
 
@@ -1116,7 +1398,14 @@ def main():
         f"run_tag={run_tag} device={device} epochs={epochs} batch_size={batch_size} "
         f"state_mode={args.state_mode} phase={args.phase} distill_weight={args.distill_weight} "
         f"z_eval_mode={args.z_eval_mode} z_update_order={args.z_update_order} z_zero_levels={args.z_zero_levels} "
-        f"use_lfm={args.use_local_frequency_mixer} w_mse={args.w_mse} w_band={args.w_band_balanced}"
+        f"freq_state_mode={args.freq_state_mode} state_conv_type={args.state_conv_type} "
+        f"state_kernel={args.state_kernel_size} "
+        f"use_lfm={args.use_local_frequency_mixer} use_linear_attn={args.use_linear_frequency_attention} "
+        f"use_wfm={args.use_windowed_frequency_mixer} "
+        f"use_chdwt={args.use_channel_dwt_adapter} use_wfanet_two_stage={args.use_wfanet_two_stage} "
+        f"share_scale_recurrent={args.share_scale_recurrent} phase1_preset={args.phase1_preset} "
+        f"w_mse={args.w_mse} w_band={args.w_band_balanced} "
+        f"w_ms_fid={args.w_ms_fidelity} w_pan_fid={args.w_pan_fidelity}"
     )
 
     for epoch in range(start_epoch, epochs):
@@ -1150,6 +1439,8 @@ def main():
         wave_meter = 0.0
         ll_meter = 0.0
         ssim_meter = 0.0
+        ms_fid_meter = 0.0
+        pan_fid_meter = 0.0
         distill_meter = 0.0
         z_res_ll_meter = 0.0
         z_res_hf_meter = 0.0
@@ -1224,6 +1515,8 @@ def main():
             loss_l1 = l1_loss(pred, gt)
             loss_mse = F.mse_loss(pred, gt) if args.w_mse > 0 else pred.new_tensor(0.0)
             loss_band = band_balanced_l1_loss(pred, gt) if args.w_band_balanced > 0 else pred.new_tensor(0.0)
+            loss_ms_fid = ms_fidelity_loss(pred, ms) if args.w_ms_fidelity > 0 else pred.new_tensor(0.0)
+            loss_pan_fid = pan_fidelity_loss(pred, pan) if args.w_pan_fidelity > 0 else pred.new_tensor(0.0)
             loss_sam = sam_loss(pred, gt) if args.w_sam > 0 else pred.new_tensor(0.0)
             loss_edge = l1_loss(sobel_edges(pred), sobel_edges(gt)) if args.w_edge > 0 else pred.new_tensor(0.0)
             loss_wave = (
@@ -1248,6 +1541,8 @@ def main():
                 + args.w_sam * loss_sam
                 + args.w_mse * loss_mse
                 + args.w_band_balanced * loss_band
+                + args.w_ms_fidelity * loss_ms_fid
+                + args.w_pan_fidelity * loss_pan_fid
                 + args.w_edge * loss_edge
                 + args.w_wavelet_hf * loss_wave
                 + args.w_ll * loss_ll
@@ -1293,6 +1588,8 @@ def main():
             wave_meter += loss_wave.item()
             ll_meter += loss_ll.item()
             ssim_meter += loss_ssim.item()
+            ms_fid_meter += loss_ms_fid.item()
+            pan_fid_meter += loss_pan_fid.item()
             distill_meter += loss_distill.item()
             kl_meter += kl_safe.item()
             z_res_ll_meter += loss_z_res_ll.item()
@@ -1308,6 +1605,8 @@ def main():
         avg_wave = wave_meter / max(1, steps_done)
         avg_ll = ll_meter / max(1, steps_done)
         avg_ssim = ssim_meter / max(1, steps_done)
+        avg_ms_fid = ms_fid_meter / max(1, steps_done)
+        avg_pan_fid = pan_fid_meter / max(1, steps_done)
         avg_distill = distill_meter / max(1, steps_done)
         avg_kl = kl_meter / max(1, steps_done)
 
@@ -1320,6 +1619,8 @@ def main():
         history["wave"].append(avg_wave)
         history["ll"].append(avg_ll)
         history["ssim"].append(avg_ssim)
+        history["ms_fid"].append(avg_ms_fid)
+        history["pan_fid"].append(avg_pan_fid)
         history["z_res_ll"].append(z_res_ll_meter / max(1, steps_done))
         history["z_res_hf"].append(z_res_hf_meter / max(1, steps_done))
         history["distill"].append(avg_distill)
@@ -1449,7 +1750,8 @@ def main():
             f"epoch {epoch + 1:03d}/{epochs} "
             f"loss={avg_total:.6f} l1={avg_l1:.6f} mse={avg_mse:.6f} band={avg_band:.6f} sam={avg_sam:.6f} "
             f"edge={avg_edge:.6f} wave={avg_wave:.6f} ll={avg_ll:.6f} "
-            f"ssim={avg_ssim:.6f} distill={avg_distill:.6f} kl={avg_kl:.6f} bad_steps={bad_step_count} "
+            f"ssim={avg_ssim:.6f} ms_fid={avg_ms_fid:.6f} pan_fid={avg_pan_fid:.6f} "
+            f"distill={avg_distill:.6f} kl={avg_kl:.6f} bad_steps={bad_step_count} "
             f"beta={kl_beta:.6e} lr={lr:.3e} time={dt:.1f}s"
         )
 
