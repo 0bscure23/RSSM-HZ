@@ -92,6 +92,7 @@ def main():
             "seed": run_args.get("seed"),
             "ckpt_epoch": obj.get("epoch"),
             "n_test": n,
+            "q_win_size": args.q_win_size,
             "fullframe_metrics": m,
         }
         rows.append(row)
@@ -103,7 +104,7 @@ def main():
         print(
             f"{row['run']}: ep{row['ckpt_epoch']} "
             f"PSNR={m['PSNR']:.4f} SAM={m['SAM']:.4f} "
-            f"ERGAS={m['ERGAS']:.4f} Q4={m['Q']:.6f}",
+            f"ERGAS={m['ERGAS']:.4f} Q{args.q_win_size}={m['Q']:.6f}",
             flush=True,
         )
 

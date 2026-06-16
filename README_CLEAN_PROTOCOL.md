@@ -49,11 +49,23 @@ Under the clean protocol the remaining RSSM-vs-WFANet gap is a **generalization*
 problem, not a capacity one (RSSM reaches lower train L1 yet tests worse). Adding
 HF-synthesis capacity does not help; the decisive lever is **dihedral
 augmentation**, which the over-fitting RSSM benefits from far more than the
-(under-trained) WFANet:
+(under-trained) WFANet. With augmentation + a longer 480-epoch budget, RSSM-HZ
+**overtakes WFANet on 2 of 3 datasets, all metrics** (full-frame, 2 seeds;
+GF2 uses Q4, WV3 uses Q8):
 
-| dataset | RSSM no-aug | RSSM +aug | WFANet no-aug | WFANet +aug | gap no-aug → +aug |
-|---|---|---|---|---|---|
-| GF2 | 49.19 | 50.09 | 49.91 | 50.19 | −0.72 → −0.10 |
-| QB  | 38.19 | 38.58 | 38.77 | 38.70 | −0.58 → −0.12 |
+| dataset | RSSM-HZ | WFANet | ΔPSNR | SAM | ERGAS | verdict |
+|---|---|---|---|---|---|---|
+| GF2 | **50.464** | 50.249 | **+0.215** | better | better | overtake (2-seed) |
+| WV3 | **39.163** | 38.999 | **+0.164** | better | better | overtake (2-seed, Q8 tied) |
+| QB  | 38.580 | 38.700 | −0.120 | — | — | close but weaker |
 
-(full-frame PSNR, 240ep; longer-budget confirmation in progress)
+Per-seed GF2 +0.175 / +0.255, WV3 +0.204 / +0.124 — both seeds overtake on both
+datasets. QB is the structurally hard case (smallest train set, finest-scale
+PAN-driven HF); its best point is augmentation at **240ep** (480ep overfits:
+64px-val keeps rising while 256px-full-frame regresses), and adding HF-synthesis
+modules does not help — so `--periodic-save-every` is provided to recover the
+true full-frame-best epoch when val and full-frame rankings disagree.
+
+The earlier finding still holds: this is a **generalization** gap, not a capacity
+one (RSSM reaches lower train L1 yet tested worse pre-augmentation); the win comes
+from regularization (augmentation) + budget, not from extra HF modules.

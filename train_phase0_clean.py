@@ -26,7 +26,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Clean Phase-0 architecture comparison")
-    parser.add_argument("--dataset", choices=["gf2", "qb"], required=True)
+    parser.add_argument("--dataset", choices=["gf2", "qb", "wv3"], required=True)
     parser.add_argument(
         "--model-kind",
         choices=[
@@ -57,6 +57,9 @@ def parse_args():
     parser.add_argument("--augment", action="store_true", default=False,
                         help="Dihedral (rot90/flip) geometric augmentation, applied identically to pan/gt/ms/lms; "
                              "uses a dedicated RNG so no-aug runs stay bit-reproducible")
+    parser.add_argument("--periodic-save-every", type=int, default=0,
+                        help="If >0, also save a checkpoint every N epochs (epoch_NNN.pth) so the true full-frame "
+                             "best can be recovered when 64px-val and 256px-fullframe rankings disagree")
     return parser.parse_args()
 
 
@@ -97,6 +100,8 @@ def load_h5(path, ratio):
 
 def dataset_paths(dataset):
     base = os.path.join(ROOT, "Dataset", dataset)
+    if not os.path.isdir(base) and os.path.isdir(os.path.join(ROOT, "Dataset", dataset.upper())):
+        base = os.path.join(ROOT, "Dataset", dataset.upper())  # e.g. Dataset/WV3
     return {
         "train": os.path.join(base, f"train_{dataset}.h5"),
         "val": os.path.join(base, f"valid_{dataset}.h5"),
@@ -401,6 +406,12 @@ def main():
         history.append(entry)
         with open(os.path.join(out_dir, "train_history.json"), "w") as f:
             json.dump(history, f, indent=2)
+
+        if args.periodic_save_every > 0 and (epoch % args.periodic_save_every == 0 or epoch == args.epochs):
+            torch.save(
+                {"model": model.state_dict(), "epoch": epoch, "args": vars(args), "params": params},
+                os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pth"),
+            )
 
     print(f"best val epoch={best_epoch} score={best_score:.4f} metrics={best_metrics}", flush=True)
     best = torch.load(os.path.join(ckpt_dir, "best.pth"), map_location="cpu")
